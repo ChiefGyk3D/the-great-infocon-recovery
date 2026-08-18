@@ -229,7 +229,7 @@ python infocon_scraper.py \
   --with-torrents
 ```
 
-The combined workflow adds all available DEF CON torrents and waits for their initial file checking to finish. It then starts the HTTP crawl while libtorrent continues downloading the checked torrent content. HTTP automatically skips DEF CON folders represented by torrents, so the two phases do not intentionally duplicate those archives. A single drive-level lock remains held by the parent process until both phases finish.
+The combined workflow adds all available DEF CON torrents and immediately crawls non-DEF CON content while their initial file checking runs. Once every torrent leaves its checking states, HTTP crawls the torrentless DEF CON remainder while libtorrent continues downloading the checked torrent content. HTTP automatically skips DEF CON folders represented by torrents, so the two phases do not intentionally duplicate those archives. A single drive-level lock remains held by the parent process until both phases finish.
 
 DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and any special folders not represented by torrents.
 
