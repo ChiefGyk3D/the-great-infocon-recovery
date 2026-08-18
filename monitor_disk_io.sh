@@ -18,9 +18,6 @@ read -r previous_reads previous_merges previous_read_sectors previous_read_ms \
     previous_inflight previous_io_ms previous_weighted_ms <<< "$(read_stats)"
 
 while :; do
-    clear
-    printf 'InfoCon disk I/O  %s  device=%s  refresh=%ss\n\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "$DEVICE" "$INTERVAL"
     read -r current_reads current_merges current_read_sectors current_read_ms \
         current_writes current_write_merges current_write_sectors current_write_ms \
         current_inflight current_io_ms current_weighted_ms <<< "$(read_stats)"
@@ -41,6 +38,9 @@ while :; do
     util_tenths=$((io_ms_delta * 10 / INTERVAL))
     if (( util_tenths > 1000 )); then util_tenths=1000; fi
 
+    clear
+    printf 'InfoCon disk I/O  %s  device=%s  refresh=%ss\n\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$DEVICE" "$INTERVAL"
     printf 'read:   %8s/s  %8s ops\n' "$(numfmt --to=iec "$read_rate")" "$read_delta"
     printf 'write:  %8s/s  %8s ops\n' "$(numfmt --to=iec "$write_rate")" "$write_delta"
     printf 'queue:  current=%s requests-in-flight\n' "$current_inflight"

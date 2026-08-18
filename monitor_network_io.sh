@@ -14,9 +14,6 @@ read -r previous_rx previous_rx_packets previous_rx_errors previous_rx_drops \
     previous_tx previous_tx_packets previous_tx_errors previous_tx_drops <<< "$(read_net)"
 
 while :; do
-    clear
-    printf 'InfoCon network I/O  %s  interface=%s  refresh=%ss\n\n' \
-        "$(date '+%Y-%m-%d %H:%M:%S')" "$INTERFACE" "$INTERVAL"
     read -r current_rx current_rx_packets current_rx_errors current_rx_drops \
         current_tx current_tx_packets current_tx_errors current_tx_drops <<< "$(read_net)"
 
@@ -25,6 +22,9 @@ while :; do
     rx_packets=$(( (current_rx_packets - previous_rx_packets) / INTERVAL ))
     tx_packets=$(( (current_tx_packets - previous_tx_packets) / INTERVAL ))
 
+    clear
+    printf 'InfoCon network I/O  %s  interface=%s  refresh=%ss\n\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$INTERFACE" "$INTERVAL"
     printf 'receive: %8s/s  %8s packets/s\n' "$(numfmt --to=iec "$rx_bytes")" "$rx_packets"
     printf 'transmit:%8s/s  %8s packets/s\n' "$(numfmt --to=iec "$tx_bytes")" "$tx_packets"
     printf 'errors:  RX=%s  TX=%s\n' "$((current_rx_errors - previous_rx_errors))" "$((current_tx_errors - previous_tx_errors))"
