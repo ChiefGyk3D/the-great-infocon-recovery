@@ -56,6 +56,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urljoin, urlparse
@@ -100,6 +101,199 @@ class RemoteFile:
 
 class CurlError(RuntimeError):
     pass
+
+
+@dataclass
+class RunConfig:
+    retries: int = 4
+    download_timeout: int = 3600
+    min_free_bytes: int = 1 << 30  # keep at least 1 GiB free
+    manifest_save_every: int = 200
+
+
+# Populated once in main() before any worker starts; read-only during a run.
+RUN = RunConfig()
+
+
+def human_bytes(n: float) -> str:
+    """Compact human-readable byte count, e.g. 12.3 MB."""
+    step = 1000.0
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < step or unit == "PB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= step
+    return f"{n:.1f} PB"
+
+
+def format_duration(seconds: float) -> str:
+    """Compact H:MM:SS / M:SS duration, or '--' when unknown."""
+    if seconds <= 0 or seconds != seconds or seconds == float("inf"):
+        return "--"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def progress_bar(fraction: float, width: int = 24) -> str:
+    """ASCII progress bar like [########----------------]."""
+    fraction = 0.0 if fraction < 0 else (1.0 if fraction > 1 else fraction)
+    filled = int(round(fraction * width))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+class ProgressStats:
+    """Thread-safe aggregate counters shared between the download workers and
+    the status reporter thread."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.start = time.time()
+        self.discovered = 0
+        self.completed = 0
+        self.downloaded_files = 0
+        self.downloaded_bytes = 0
+        self.skipped = 0
+        self.errors = 0
+        self.active = 0
+
+    def add_discovered(self, n: int = 1) -> None:
+        with self.lock:
+            self.discovered += n
+
+    def download_started(self) -> None:
+        with self.lock:
+            self.active += 1
+
+    def download_finished(self, status: str, nbytes: int) -> None:
+        with self.lock:
+            self.active = max(0, self.active - 1)
+            self.completed += 1
+            if status == "downloaded":
+                self.downloaded_files += 1
+                self.downloaded_bytes += nbytes
+            elif status.startswith("error"):
+                self.errors += 1
+            elif status.startswith("skip") or status == "baseline-recorded":
+                self.skipped += 1
+
+    def snapshot(self) -> dict[str, float]:
+        with self.lock:
+            return {
+                "discovered": self.discovered,
+                "completed": self.completed,
+                "downloaded_files": self.downloaded_files,
+                "downloaded_bytes": self.downloaded_bytes,
+                "skipped": self.skipped,
+                "errors": self.errors,
+                "active": self.active,
+            }
+
+
+class StatusReporter(threading.Thread):
+    """Periodically emits an aggregate progress line (bar, counts, speed, ETA).
+    Renders a live single-line bar when stdout is a TTY, and always logs a
+    snapshot line so `tail -f` on the log shows progress too."""
+
+    def __init__(self, stats: ProgressStats, interval: float = 10.0) -> None:
+        super().__init__(daemon=True)
+        self.stats = stats
+        self.interval = max(1.0, interval)
+        self._stop_event = threading.Event()
+        self.is_tty = sys.stdout.isatty()
+        self._last_time = stats.start
+        self._last_bytes = 0
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self.interval):
+            self._emit()
+        self._emit(final=True)
+
+    def _emit(self, final: bool = False) -> None:
+        s = self.stats.snapshot()
+        now = time.time()
+        elapsed = now - self.stats.start
+        window = now - self._last_time
+        cur_rate = (s["downloaded_bytes"] - self._last_bytes) / window if window > 0 else 0.0
+        avg_rate = s["downloaded_bytes"] / elapsed if elapsed > 0 else 0.0
+        self._last_time = now
+        self._last_bytes = s["downloaded_bytes"]
+
+        discovered = s["discovered"]
+        completed = s["completed"]
+        fraction = (completed / discovered) if discovered else 0.0
+        comp_rate = completed / elapsed if elapsed > 0 else 0.0
+        remaining = max(discovered - completed, 0)
+        eta = remaining / comp_rate if comp_rate > 0 else 0.0
+
+        line = (
+            f"{progress_bar(fraction)} {completed}/{discovered} ({fraction * 100:4.1f}%) | "
+            f"dl {int(s['downloaded_files'])} files {human_bytes(s['downloaded_bytes'])} "
+            f"@ {human_bytes(cur_rate)}/s (avg {human_bytes(avg_rate)}/s) | "
+            f"skip {int(s['skipped'])} err {int(s['errors'])} | act {int(s['active'])} | "
+            f"{format_duration(elapsed)} elapsed, ETA {format_duration(eta)}"
+        )
+
+        if self.is_tty and not final:
+            sys.stdout.write("\r" + line)
+            sys.stdout.flush()
+        else:
+            if self.is_tty:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            log.info(line)
+
+
+def has_free_space(directory: str, needed: int) -> bool:
+    """True if directory's filesystem can hold `needed` bytes plus the safety margin."""
+    try:
+        free = shutil.disk_usage(directory).free
+    except OSError:
+        return True  # can't tell; don't block on it
+    return free >= needed + RUN.min_free_bytes
+
+
+def acquire_lock(lock_path: str, force: bool = False) -> bool:
+    """Create an exclusive PID lock file. Returns False if a live instance holds it.
+    A stale lock (owning PID no longer running) is reclaimed automatically."""
+    if os.path.exists(lock_path):
+        try:
+            existing_pid = int(open(lock_path, encoding="utf-8").read().strip() or "0")
+        except (OSError, ValueError):
+            existing_pid = 0
+        if existing_pid and _pid_alive(existing_pid) and not force:
+            return False
+        _safe_remove(lock_path)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def release_lock(lock_path: str) -> None:
+    try:
+        if os.path.exists(lock_path) and open(lock_path, encoding="utf-8").read().strip() == str(os.getpid()):
+            _safe_remove(lock_path)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 # media.defcon.org appears to throttle/drop connections once too many are
@@ -167,6 +361,43 @@ def curl_download(url: str, local_path: str, resume: bool, timeout: int = 3600) 
         raise CurlError(f"curl download failed ({proc.returncode}) for {url}: {proc.stderr.decode(errors='replace').strip()}")
 
 
+def download_atomic(url: str, local_path: str, remote_size: int | None) -> None:
+    """Download to a .part sibling and rename into place only after the size is
+    verified, so an interrupted or truncated transfer never leaves a file that
+    looks complete. Resumes an existing .part when the server supports it, and
+    retries with backoff on failure or size mismatch."""
+    part = local_path + ".part"
+    last_err: str | None = None
+    for attempt in range(1, RUN.retries + 1):
+        resume = bool(remote_size and os.path.exists(part) and 0 < os.path.getsize(part) < remote_size)
+        try:
+            curl_download(url, part, resume=resume, timeout=RUN.download_timeout)
+        except CurlError as exc:
+            last_err = str(exc)
+            # An overshoot means the .part is unusable for resume; start clean next time.
+            if os.path.exists(part) and remote_size and os.path.getsize(part) > remote_size:
+                _safe_remove(part)
+            time.sleep(min(30, 3 * attempt))
+            continue
+        got = os.path.getsize(part) if os.path.exists(part) else 0
+        if remote_size is not None and got != remote_size:
+            last_err = f"size mismatch (got {got}, expected {remote_size})"
+            if got > remote_size:
+                _safe_remove(part)
+            time.sleep(min(30, 3 * attempt))
+            continue
+        os.replace(part, local_path)
+        return
+    raise CurlError(f"download failed after {RUN.retries} attempts for {url}: {last_err}")
+
+
+def _safe_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def list_directory(url: str) -> list[dict]:
     """Parse one fancyindex directory listing page into entries."""
     html = curl_get_text(url)
@@ -192,7 +423,10 @@ def list_directory(url: str) -> list[dict]:
 
 
 def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest", crawl_workers: int,
-             download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event) -> dict[str, int]:
+             download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event,
+             initial_files: list[RemoteFile] | None = None,
+             max_pending_downloads: int | None = None,
+             stats: "ProgressStats | None" = None) -> dict[str, int]:
     """Crawl and download at the same time: as soon as a file is discovered it's
     handed to the download pool immediately, instead of waiting for the entire
     site to be crawled first. This is what lets priority roots (DEF CON,
@@ -203,19 +437,27 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
     counts: dict[str, int] = {}
     discovered = 0
     completed = 0
+    ready_files = deque(initial_files or [])
+    if initial_files and stats:
+        stats.add_discovered(len(initial_files))
+    discovered += len(initial_files or [])
+    pending_downloads = 0
+    download_limit = max_pending_downloads or max(download_workers * 4, download_workers)
 
     with ThreadPoolExecutor(max_workers=crawl_workers) as crawl_pool, \
             ThreadPoolExecutor(max_workers=download_workers) as dl_pool:
         pending: dict = {}
         for url, rel in roots:
             pending[crawl_pool.submit(list_directory, url)] = ("list", (url, rel))
-
         while pending:
             if stop_requested.is_set():
                 break
             done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
             for fut in done:
-                kind, payload = pending.pop(fut)
+                kind, payload = pending[fut]
+                if kind == "list" and pending_downloads >= download_limit:
+                    continue
+                pending.pop(fut)
                 if kind == "list":
                     url, rel = payload
                     try:
@@ -232,19 +474,40 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                         else:
                             item = RemoteFile(url=child_url, rel_path=child_rel)
                             discovered += 1
-                            pending[dl_pool.submit(sync_file, item, dest_root, manifest, verify_all, dry_run)] = \
-                                ("sync", item)
+                            if stats:
+                                stats.add_discovered()
+                            ready_files.append(item)
                 else:
                     item = payload
+                    pending_downloads -= 1
                     try:
-                        result = fut.result()
+                        result, nbytes = fut.result()
                     except Exception as exc:  # noqa: BLE001 - log and continue
                         log.error("Unexpected error for %s: %s", item.rel_path, exc)
-                        result = "error"
+                        result, nbytes = "error", 0
                     counts[result] = counts.get(result, 0) + 1
                     completed += 1
+                    if stats:
+                        stats.download_finished(result, nbytes)
+                    if result == "error-diskfull":
+                        log.error("Halting: destination filesystem is full.")
+                        stop_requested.set()
                     if completed % 25 == 0:
                         log.info("Progress: %d files completed (%d discovered so far)", completed, discovered)
+                    if completed % RUN.manifest_save_every == 0 and not dry_run:
+                        manifest.save()
+
+            while ready_files and pending_downloads < download_limit:
+                item = ready_files.popleft()
+                pending[dl_pool.submit(sync_file, item, dest_root, manifest, verify_all, dry_run)] = \
+                    ("sync", item)
+                pending_downloads += 1
+                if stats:
+                    stats.download_started()
+
+            if not pending and ready_files:
+                log.error("Stopping with %d discovered files still queued", len(ready_files))
+                break
 
     log.info("Progress: %d files completed (%d discovered total)", completed, discovered)
     return counts
@@ -300,19 +563,19 @@ def is_unpacked_archive_duplicate(local_path: str) -> bool:
 
 
 def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
-              verify_all: bool, dry_run: bool) -> str:
+              verify_all: bool, dry_run: bool) -> tuple[str, int]:
     local_path = os.path.join(dest_root, item.rel_path)
     rel = item.rel_path
 
     if is_unpacked_archive_duplicate(local_path):
         log.info("Skipping %s (already have the unpacked folder)", rel)
-        return "skip-duplicate-archive"
+        return "skip-duplicate-archive", 0
 
     try:
         remote_size = curl_head_size(item.url)
     except CurlError as exc:
         log.error("HEAD failed for %s: %s", item.url, exc)
-        return "error"
+        return "error", 0
 
     exists = os.path.exists(local_path)
     local_size = os.path.getsize(local_path) if exists else 0
@@ -320,41 +583,51 @@ def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
     if exists and remote_size is not None and local_size == remote_size:
         entry = manifest.get(rel)
         if entry and entry.get("size") == remote_size and not verify_all:
-            return "skip-known-good"
+            return "skip-known-good", 0
         digest = sha256_file(local_path)
         if entry and entry.get("sha256") == digest:
             manifest.set(rel, {"size": remote_size, "sha256": digest, "url": item.url,
                                 "verified": time.time()})
-            return "skip-verified"
+            return "skip-verified", 0
         if entry and entry.get("sha256") != digest:
             log.warning("Corruption detected for %s (hash mismatch), re-downloading", rel)
         else:
             manifest.set(rel, {"size": remote_size, "sha256": digest, "url": item.url,
                                 "verified": time.time()})
-            return "baseline-recorded"
+            return "baseline-recorded", 0
+
+    part_path = local_path + ".part"
+    part_size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
 
     if dry_run:
-        action = "would-resume" if exists and remote_size and local_size < remote_size else "would-download"
+        resuming = remote_size and (0 < local_size < remote_size or 0 < part_size < remote_size)
+        action = "would-resume" if resuming else "would-download"
         log.info("[dry-run] %s -> %s", action, rel)
-        return action
+        return action, 0
 
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    resume = bool(exists and remote_size and local_size < remote_size)
+
+    # Only the bytes still needed matter for the space check (resuming a .part).
+    needed = (remote_size - part_size) if (remote_size and part_size < remote_size) else (remote_size or 0)
+    if remote_size and not has_free_space(os.path.dirname(local_path) or ".", needed):
+        log.error("Insufficient free space for %s (needs ~%d bytes)", rel, needed)
+        return "error-diskfull", 0
+
     try:
-        curl_download(item.url, local_path, resume=resume)
+        download_atomic(item.url, local_path, remote_size)
     except CurlError as exc:
         log.error("Download failed for %s: %s", item.url, exc)
-        return "error"
+        return "error", 0
 
     final_size = os.path.getsize(local_path)
     if remote_size is not None and final_size != remote_size:
         log.error("Size mismatch after download for %s (got %d, expected %d)", rel, final_size, remote_size)
-        return "error"
+        return "error", 0
 
     digest = sha256_file(local_path)
     manifest.set(rel, {"size": final_size, "sha256": digest, "url": item.url, "verified": time.time()})
     log.info("Downloaded %s (%d bytes)", rel, final_size)
-    return "downloaded"
+    return "downloaded", final_size
 
 
 def conf_priority_rank(name: str) -> int:
@@ -374,7 +647,8 @@ def discover_cons_folders(root_url: str) -> list[str]:
 
 
 def build_infocon_roots(root_url: str, only_cons: list[str] | None,
-                        only_top: list[str] | None) -> list[tuple[str, str]]:
+                        only_top: list[str] | None,
+                        only_mirrors: list[str] | None) -> list[tuple[str, str]]:
     """Build (url, rel_prefix) roots for infocon.org, ordered DEF CON, then BSides, then the rest."""
     cons_names = discover_cons_folders(root_url)
     if only_cons:
@@ -389,6 +663,14 @@ def build_infocon_roots(root_url: str, only_cons: list[str] | None,
         filters = [f.lower() for f in only_top]
         sections = [s for s in sections if any(f in s.lower() for f in filters)]
     roots += [(urljoin(root_url, f"{quote(s)}/"), s) for s in sections]
+    if only_mirrors:
+        mirror_filters = [f.lower() for f in only_mirrors]
+        mirror_entries = discover_top_level_folders(urljoin(root_url, "mirrors/"))
+        roots.extend(
+            (urljoin(root_url, f"mirrors/{quote(name)}/"), f"mirrors/{name}")
+            for name in mirror_entries
+            if any(f in name.lower() for f in mirror_filters)
+        )
     return roots
 
 
@@ -397,28 +679,90 @@ def discover_top_level_folders(root_url: str) -> list[str]:
     return [e["name"] for e in entries if e["is_dir"]]
 
 
-def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None) -> list[tuple[str, str]]:
+def discover_mirror_files(root_url: str, filters: list[str] | None) -> list[RemoteFile]:
+    entries = list_directory(urljoin(root_url, "mirrors/"))
+    if not filters:
+        return []
+    lowered = [f.lower() for f in filters]
+    return [
+        RemoteFile(url=urljoin(urljoin(root_url, "mirrors/"), entry["href"]),
+                   rel_path=os.path.join("mirrors", entry["name"]))
+        for entry in entries
+        if not entry["is_dir"]
+        and not entry["name"].lower().endswith(".torrent")
+        and any(f in entry["name"].lower() for f in lowered)
+    ]
+
+
+def build_mirror_roots(root_url: str, filters: list[str] | None) -> list[tuple[str, str]]:
+    if not filters:
+        return [(urljoin(root_url, "mirrors/"), "mirrors")]
+    lowered = [f.lower() for f in filters]
+    return [
+        (urljoin(root_url, f"mirrors/{quote(name)}/"), f"mirrors/{name}")
+        for name in discover_top_level_folders(urljoin(root_url, "mirrors/"))
+        if any(f in name.lower() for f in lowered)
+    ]
+
+
+def defcon_torrent_covered_names(media_root: str) -> set[str]:
+    """Lowercased base names of DEF CON items that already have a torrent on
+    media.defcon.org/DEF CON Torrents/ (e.g. 'def con 30', 'def con conference
+    cd dvd collection'). Used to keep the HTTP crawl from re-fetching content
+    that the torrent helper already covers."""
+    try:
+        entries = list_directory(urljoin(media_root, quote("DEF CON Torrents") + "/"))
+    except CurlError:
+        return set()
+    bases: set[str] = set()
+    for e in entries:
+        if e["is_dir"] or not e["name"].endswith(".torrent"):
+            continue
+        m = re.match(r"^(.*) v\d+\.torrent$", e["name"])
+        if m:
+            bases.add(m.group(1).strip().lower())
+    return bases
+
+
+def _is_torrent_covered(folder: str, torrent_bases: set[str]) -> bool:
+    f = folder.strip().lower()
+    # Exact match, or the torrent base is a longer variant (e.g. folder
+    # "DEF CON Conference CD DVD" vs torrent "... CD DVD Collection").
+    return any(tb == f or tb.startswith(f + " ") for tb in torrent_bases)
+
+
+def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None,
+                             skip_torrented: bool = True) -> list[tuple[str, str]]:
     """Expand media.defcon.org's root into per-folder roots, targeting the same
     cons/DEF CON/ location infocon.org uses so both sources land in one place.
     Per-file skip/verify logic in sync_file() already avoids re-downloading
     years that are complete locally - a folder-existence pre-filter would
-    wrongly skip years that are only partially downloaded so far."""
+    wrongly skip years that are only partially downloaded so far. When
+    skip_torrented is set, folders that already have a torrent are skipped so
+    HTTP only fetches the torrentless remainder (e.g. DEF CON 34)."""
     skip = {n.lower() for n in (skip_names or set())}
-    names = [n for n in discover_top_level_folders(root_url) if n.lower() not in skip]
+    torrent_bases = defcon_torrent_covered_names(root_url) if skip_torrented else set()
+    names = [
+        n for n in discover_top_level_folders(root_url)
+        if n.lower() not in skip and not _is_torrent_covered(n, torrent_bases)
+    ]
     names.sort(key=lambda n: (conf_priority_rank(n), n.lower()))
     return [(urljoin(root_url, f"{quote(n)}/"), f"cons/DEF CON/{n}") for n in names]
 
 
 def build_roots(sources: list[str], infocon_root: str, defcon_media_root: str, defcon_media_skip: set[str] | None,
-                 only_cons: list[str] | None, only_top: list[str] | None) -> list[tuple[str, str]]:
+                 only_cons: list[str] | None, only_top: list[str] | None,
+                 only_mirrors: list[str] | None, skip_torrented: bool = True) -> list[tuple[str, str]]:
     roots: list[tuple[str, str]] = []
     # media.defcon.org goes first: it's the highest-priority content (DEF CON)
     # and all its roots are submitted for crawling up front, so it shouldn't
     # sit behind ~240 infocon.org conference folders in the submission queue.
     if "defcon-media" in sources:
-        roots += build_defcon_media_roots(defcon_media_root, defcon_media_skip)
+        roots += build_defcon_media_roots(defcon_media_root, defcon_media_skip, skip_torrented)
     if "infocon" in sources:
-        roots += build_infocon_roots(infocon_root, only_cons, only_top)
+        roots += build_infocon_roots(infocon_root, only_cons, only_top, only_mirrors)
+    elif "mirrors" in sources:
+        roots += build_mirror_roots(infocon_root, only_mirrors)
     return roots
 
 
@@ -475,19 +819,40 @@ def main() -> int:
     parser.add_argument("--defcon-media-url", default=DEFCON_MEDIA_ROOT_URL,
                          help="Root URL of media.defcon.org (DEF CON's own authoritative media server)")
     parser.add_argument("--sources", default="infocon,defcon-media",
-                         help="Comma-separated sources to sync: 'infocon' (everything on infocon.org) and/or "
-                              "'defcon-media' (media.defcon.org, DEF CON only). Default: both.")
+                        help="Comma-separated sources to sync: 'infocon' (everything on infocon.org), "
+                            "'mirrors' (only infocon.org/mirrors), and/or 'defcon-media' (media.defcon.org). "
+                            "Default: infocon,defcon-media. DEF CON folders that already have a torrent are "
+                            "auto-skipped (grab those with fetch_defcon_torrents.py); HTTP crawls everything "
+                            "else, including the torrentless remainder such as DEF CON 34.")
     parser.add_argument("--only-cons", default=None,
                          help="Comma-separated substrings to restrict which infocon.org cons/ conferences are "
                               "synced (default: all conferences)")
     parser.add_argument("--only-top", default=None,
                          help="Comma-separated substrings to restrict which infocon.org top-level sections "
                               "besides cons/ are synced, e.g. 'documentaries,podcasts' (default: all sections)")
+    parser.add_argument("--only-mirrors", default=None,
+                         help="Comma-separated mirror name filters, e.g. 'cryptome,textfiles'; downloads only "
+                              "matching collections under infocon.org/mirrors/")
     parser.add_argument("--defcon-media-skip", default=None,
                          help="Comma-separated media.defcon.org folder names to skip entirely, e.g. "
                               "'DEF CON 30,DEF CON 31' when fetching those years via BitTorrent instead")
+    parser.add_argument("--no-skip-torrented", action="store_true",
+                         help="When 'defcon-media' is a source, do NOT auto-skip folders that already have a "
+                              "torrent (by default such folders are skipped so HTTP only fills gaps like DEF CON 34)")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent download workers")
+    parser.add_argument("--max-pending-downloads", type=int, default=None,
+                         help="Maximum queued/in-flight file downloads (default: workers * 4)")
     parser.add_argument("--crawl-workers", type=int, default=16, help="Concurrent directory-listing workers")
+    parser.add_argument("--status-interval", type=float, default=10.0,
+                         help="Seconds between progress/speed status lines (default: 10; 0 disables)")
+    parser.add_argument("--retries", type=int, default=4,
+                         help="Per-file download attempts before giving up (default: 4)")
+    parser.add_argument("--download-timeout", type=int, default=3600,
+                         help="Max seconds for a single file download attempt (default: 3600)")
+    parser.add_argument("--min-free-gib", type=int, default=1,
+                         help="Refuse a download that would leave less than this many GiB free (default: 1)")
+    parser.add_argument("--force", action="store_true",
+                         help="Override the single-instance lock and run anyway")
     parser.add_argument("--verify-all", action="store_true",
                          help="Re-hash every existing file in scope, not just new ones")
     parser.add_argument("--dry-run", action="store_true", help="List actions without downloading")
@@ -532,32 +897,65 @@ def main() -> int:
         print(f"Warning: could not open log file {log_file}: {exc}", file=sys.stderr)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
 
+    RUN.retries = max(1, args.retries)
+    RUN.download_timeout = max(1, args.download_timeout)
+    RUN.min_free_bytes = max(0, args.min_free_gib) * (1 << 30)
+
+    lock_path = os.path.join(args.dest, ".infocon_scraper.lock")
+    if not acquire_lock(lock_path, force=args.force):
+        log.error("Another sync appears to be running for %s (lock: %s). Use --force to override.",
+                  args.dest, lock_path)
+        return 2
+
     only_cons = [f.strip() for f in args.only_cons.split(",") if f.strip()] if args.only_cons else None
     only_top = [f.strip() for f in args.only_top.split(",") if f.strip()] if args.only_top else None
+    only_mirrors = [f.strip() for f in args.only_mirrors.split(",") if f.strip()] if args.only_mirrors else None
     defcon_media_skip = {f.strip() for f in args.defcon_media_skip.split(",") if f.strip()} \
         if args.defcon_media_skip else None
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
 
     log.info("Discovering content from sources: %s ...", ", ".join(sources))
-    roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip, only_cons, only_top)
+    roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip,
+                        only_cons, only_top, only_mirrors, skip_torrented=not args.no_skip_torrented)
     log.info("Target sections (priority order): %s", ", ".join(rel for _, rel in roots))
     manifest = Manifest(manifest_path)
 
     stop_requested = threading.Event()
 
-    def handle_sigint(signum, frame):
-        log.warning("Interrupt received, finishing in-flight downloads and saving manifest...")
+    def handle_stop(signum, frame):
+        log.warning("Signal %s received, finishing in-flight downloads and saving manifest...", signum)
         stop_requested.set()
 
-    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGINT, handle_stop)
+    signal.signal(signal.SIGTERM, handle_stop)
+
+    initial_files = discover_mirror_files(args.base_url, only_mirrors) \
+        if "infocon" in sources or "mirrors" in sources else []
+
+    stats = ProgressStats()
+    reporter = StatusReporter(stats, args.status_interval) if args.status_interval > 0 else None
+    if reporter:
+        reporter.start()
 
     try:
         counts = run_sync(roots, args.dest, manifest, args.crawl_workers, args.workers,
-                           args.verify_all, args.dry_run, stop_requested)
+                           args.verify_all, args.dry_run, stop_requested, initial_files,
+                           args.max_pending_downloads, stats)
     finally:
+        if reporter:
+            reporter.stop()
+            reporter.join(timeout=args.status_interval + 2)
         manifest.save()
+        release_lock(lock_path)
 
-    log.info("Done. Summary: %s", json.dumps(counts, indent=2))
+    final = stats.snapshot()
+    elapsed = time.time() - stats.start
+    avg_rate = final["downloaded_bytes"] / elapsed if elapsed > 0 else 0.0
+    log.info("Done in %s. Downloaded %d files (%s) at %s/s avg; %d skipped, %d errors.",
+             format_duration(elapsed), int(final["downloaded_files"]),
+             human_bytes(final["downloaded_bytes"]), human_bytes(avg_rate),
+             int(final["skipped"]), int(final["errors"]))
+    log.info("Summary: %s", json.dumps(counts, indent=2))
     return 1 if counts.get("error") else 0
 
 
