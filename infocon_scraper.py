@@ -561,27 +561,60 @@ def build_mirror_roots(root_url: str, filters: list[str] | None) -> list[tuple[s
     ]
 
 
-def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None) -> list[tuple[str, str]]:
+def defcon_torrent_covered_names(media_root: str) -> set[str]:
+    """Lowercased base names of DEF CON items that already have a torrent on
+    media.defcon.org/DEF CON Torrents/ (e.g. 'def con 30', 'def con conference
+    cd dvd collection'). Used to keep the HTTP crawl from re-fetching content
+    that the torrent helper already covers."""
+    try:
+        entries = list_directory(urljoin(media_root, quote("DEF CON Torrents") + "/"))
+    except CurlError:
+        return set()
+    bases: set[str] = set()
+    for e in entries:
+        if e["is_dir"] or not e["name"].endswith(".torrent"):
+            continue
+        m = re.match(r"^(.*) v\d+\.torrent$", e["name"])
+        if m:
+            bases.add(m.group(1).strip().lower())
+    return bases
+
+
+def _is_torrent_covered(folder: str, torrent_bases: set[str]) -> bool:
+    f = folder.strip().lower()
+    # Exact match, or the torrent base is a longer variant (e.g. folder
+    # "DEF CON Conference CD DVD" vs torrent "... CD DVD Collection").
+    return any(tb == f or tb.startswith(f + " ") for tb in torrent_bases)
+
+
+def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None,
+                             skip_torrented: bool = True) -> list[tuple[str, str]]:
     """Expand media.defcon.org's root into per-folder roots, targeting the same
     cons/DEF CON/ location infocon.org uses so both sources land in one place.
     Per-file skip/verify logic in sync_file() already avoids re-downloading
     years that are complete locally - a folder-existence pre-filter would
-    wrongly skip years that are only partially downloaded so far."""
+    wrongly skip years that are only partially downloaded so far. When
+    skip_torrented is set, folders that already have a torrent are skipped so
+    HTTP only fetches the torrentless remainder (e.g. DEF CON 34)."""
     skip = {n.lower() for n in (skip_names or set())}
-    names = [n for n in discover_top_level_folders(root_url) if n.lower() not in skip]
+    torrent_bases = defcon_torrent_covered_names(root_url) if skip_torrented else set()
+    names = [
+        n for n in discover_top_level_folders(root_url)
+        if n.lower() not in skip and not _is_torrent_covered(n, torrent_bases)
+    ]
     names.sort(key=lambda n: (conf_priority_rank(n), n.lower()))
     return [(urljoin(root_url, f"{quote(n)}/"), f"cons/DEF CON/{n}") for n in names]
 
 
 def build_roots(sources: list[str], infocon_root: str, defcon_media_root: str, defcon_media_skip: set[str] | None,
                  only_cons: list[str] | None, only_top: list[str] | None,
-                 only_mirrors: list[str] | None) -> list[tuple[str, str]]:
+                 only_mirrors: list[str] | None, skip_torrented: bool = True) -> list[tuple[str, str]]:
     roots: list[tuple[str, str]] = []
     # media.defcon.org goes first: it's the highest-priority content (DEF CON)
     # and all its roots are submitted for crawling up front, so it shouldn't
     # sit behind ~240 infocon.org conference folders in the submission queue.
     if "defcon-media" in sources:
-        roots += build_defcon_media_roots(defcon_media_root, defcon_media_skip)
+        roots += build_defcon_media_roots(defcon_media_root, defcon_media_skip, skip_torrented)
     if "infocon" in sources:
         roots += build_infocon_roots(infocon_root, only_cons, only_top, only_mirrors)
     elif "mirrors" in sources:
@@ -643,8 +676,10 @@ def main() -> int:
                          help="Root URL of media.defcon.org (DEF CON's own authoritative media server)")
     parser.add_argument("--sources", default="infocon,defcon-media",
                         help="Comma-separated sources to sync: 'infocon' (everything on infocon.org), "
-                            "'mirrors' (only infocon.org/mirrors), and/or 'defcon-media' "
-                            "(media.defcon.org, DEF CON only). Default: both infocon and defcon-media.")
+                            "'mirrors' (only infocon.org/mirrors), and/or 'defcon-media' (media.defcon.org). "
+                            "Default: infocon,defcon-media. DEF CON folders that already have a torrent are "
+                            "auto-skipped (grab those with fetch_defcon_torrents.py); HTTP crawls everything "
+                            "else, including the torrentless remainder such as DEF CON 34.")
     parser.add_argument("--only-cons", default=None,
                          help="Comma-separated substrings to restrict which infocon.org cons/ conferences are "
                               "synced (default: all conferences)")
@@ -657,6 +692,9 @@ def main() -> int:
     parser.add_argument("--defcon-media-skip", default=None,
                          help="Comma-separated media.defcon.org folder names to skip entirely, e.g. "
                               "'DEF CON 30,DEF CON 31' when fetching those years via BitTorrent instead")
+    parser.add_argument("--no-skip-torrented", action="store_true",
+                         help="When 'defcon-media' is a source, do NOT auto-skip folders that already have a "
+                              "torrent (by default such folders are skipped so HTTP only fills gaps like DEF CON 34)")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent download workers")
     parser.add_argument("--max-pending-downloads", type=int, default=None,
                          help="Maximum queued/in-flight file downloads (default: workers * 4)")
@@ -732,7 +770,7 @@ def main() -> int:
 
     log.info("Discovering content from sources: %s ...", ", ".join(sources))
     roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip,
-                        only_cons, only_top, only_mirrors)
+                        only_cons, only_top, only_mirrors, skip_torrented=not args.no_skip_torrented)
     log.info("Target sections (priority order): %s", ", ".join(rel for _, rel in roots))
     manifest = Manifest(manifest_path)
 

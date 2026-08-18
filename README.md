@@ -124,13 +124,16 @@ python infocon_scraper.py --dest "/path/to/drive" --only-top "documentaries,podc
 # Include the large mirrors tree explicitly
 python infocon_scraper.py --dest "/path/to/drive" --only-top mirrors
 
-# Use only InfoCon or only the DEF CON media server
-python infocon_scraper.py --dest "/path/to/drive" --sources infocon
-python infocon_scraper.py --dest "/path/to/drive" --sources defcon-media
+# Default crawls everything else: all of infocon.org plus the torrentless
+# DEF CON remainder (e.g. DEF CON 34). DEF CON folders that already have a
+# torrent are auto-skipped - grab those with fetch_defcon_torrents.py.
+python infocon_scraper.py --dest "/path/to/drive"
 
-# Exclude folders being handled by torrents
-python infocon_scraper.py --dest "/path/to/drive" \
-  --defcon-media-skip "DEF CON 30,DEF CON 31,DEF CON 32,DEF CON 33"
+# Keep every media.defcon.org folder even if a torrent exists (rarely needed)
+python infocon_scraper.py --dest "/path/to/drive" --no-skip-torrented
+
+# InfoCon only, no media.defcon.org at all
+python infocon_scraper.py --dest "/path/to/drive" --sources infocon
 
 # Verify existing files without trusting size-only matches
 python infocon_scraper.py --dest "/path/to/drive" --verify-all
