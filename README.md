@@ -219,6 +219,18 @@ python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
 
 The default torrent status output reports the total rate, number of active torrents, and queued/idle torrents. A torrent showing zero peers can be queued by libtorrent or temporarily have no available peers; it is not automatically an error.
 
+### Combined Torrent and HTTP Mode
+
+To use the torrent-backed DEF CON content as the authoritative source while filling the rest of the archive over HTTP, run:
+
+```bash
+python infocon_scraper.py \
+  --dest "/path/to/InfoCon drive" \
+  --with-torrents
+```
+
+The combined workflow adds all available DEF CON torrents and waits for their initial file checking to finish. It then starts the HTTP crawl while libtorrent continues downloading the checked torrent content. HTTP automatically skips DEF CON folders represented by torrents, so the two phases do not intentionally duplicate those archives. A single drive-level lock remains held by the parent process until both phases finish.
+
 DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and any special folders not represented by torrents.
 
 > The `infocon_scraper.py --fetch-torrent` option shells out to `aria2c`, which only supports BitTorrent v1. DEF CON's per-archive torrents on `media.defcon.org` are v2, so use `fetch_defcon_torrents.py` (libtorrent) for those.
