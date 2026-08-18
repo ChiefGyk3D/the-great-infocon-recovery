@@ -1,6 +1,7 @@
 .venv/
 .monitor-tools/
 .monitor-pkgs/
+monitor-test.out.tmp.*
 __pycache__/
 *.py[cod]
 .pytest_cache/

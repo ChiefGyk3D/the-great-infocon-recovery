@@ -241,7 +241,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
             downloading = sum(1 for a in active if a[0] > 0)
             print(f"--- {done}/{len(handles)} complete | {total_rate / 1e6:6.2f} MB/s total | "
                   f"{downloading} active, {len(active) - downloading} queued/idle ---")
-            for rate, progress, peers, state, name in active[:12]:
+            for rate, progress, peers, state, name in active:
                 print(f"{name}: {progress * 100:5.1f}%  down {rate / 1e6:6.2f} MB/s  "
                       f"peers {peers}  state {state}")
             if ready_event is not None and not checking_complete and not checking:
