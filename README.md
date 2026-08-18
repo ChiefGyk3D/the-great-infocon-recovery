@@ -268,7 +268,7 @@ For a persistent detachable four-pane dashboard, use the local tmux bundle:
 ./tmux-infocon.sh attach -t infocon-monitor
 ```
 
-The panes show the scraper log, the status/network dashboard, `iostat` disk throughput, and `vmstat` system activity. Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with the same command, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
+The panes show the scraper log, a kernel-counter disk dashboard with read/write rate, queue, await, utilization, and merges, a system dashboard with memory/load/CPU/process snapshots, and the detailed status/network dashboard. Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with the same command, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
 
 The HTTP manifest is stored at `<destination>/.infocon_manifest.json` by default. Logs can be placed elsewhere with `--log-file`.
 

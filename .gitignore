@@ -10,6 +10,7 @@ __pycache__/
 run.out
 torrent.out
 infocon-monitor.out
+infocon-monitor.out.tmp.*
 *.log
 *.torrent
 .infocon_manifest.json
