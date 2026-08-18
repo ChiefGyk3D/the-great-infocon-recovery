@@ -34,15 +34,20 @@ Sizes and availability can change. Check the live listing before starting a larg
 
 ### DDV Source-Drive Relationship
 
-The public DDV historical briefings identify the five-source model used for recent DEF CON duplications as:
+The current six-drive DDV layout is:
 
-1. InfoCon.org archive
-2. Rainbow Tables 1 of 3
-3. Rainbow Tables 2 of 3
-4. Rainbow Tables 3 of 3
-5. VX Underground Archive
+| Drive | Capacity | Contents | This project's coverage |
+| --- | ---: | --- | --- |
+| A | 6 TB | 2026 InfoCon.org archive | Primary target of `infocon_scraper.py` |
+| B | 6 TB | Lanman, MSSQL, and NTLM hash tables | Separate companion dataset |
+| C | 6 TB | A5/1, GSM, and MD5 hash tables | Separate companion dataset |
+| D | 8 TB | VX Underground archive, latest papers, samples, and code | Available through the relevant `mirrors/vx underground .../` collections |
+| E | 8 TB | NTLM-9 hash tables | Separate companion dataset |
+| F | 6 TB | 4.2 Net NTLMv1 rainbow table | Separate companion dataset |
 
-That means the `mirrors/vx underground - 2025 June/` collection is directly relevant to recreating a DDV source drive. The other mirror collections listed above are useful independent archives, but they are not identified in the DDV briefings as part of those five source drives. The Rainbow Tables source is under the normal top-level `rainbow tables/` section, not under `mirrors/`.
+Drive A is the InfoCon archive this project is designed to build. Drive D's VX Underground material is represented by the relevant mirror collections described below. Drives B, C, E, and F are separate hash-table datasets and are not automatically supplied by `infocon_scraper.py`; keep them in their own destination trees rather than combining them with the InfoCon mirror.
+
+The normal top-level `rainbow tables/` section may contain related material, but it should not be treated as a complete replacement for Drives B, C, E, or F without checking the source inventory.
 
 To target the DDV-related mirror collection without crawling every conference:
 
