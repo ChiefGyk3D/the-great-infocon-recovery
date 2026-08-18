@@ -231,6 +231,17 @@ python infocon_scraper.py \
 
 The combined workflow adds all available DEF CON torrents and immediately crawls non-DEF CON content while their initial file checking runs. Once every torrent leaves its checking states, HTTP crawls the torrentless DEF CON remainder while libtorrent continues downloading the checked torrent content. HTTP automatically skips DEF CON folders represented by torrents, so the two phases do not intentionally duplicate those archives. A single drive-level lock remains held by the parent process until both phases finish.
 
+Torrent archives are added newest first by DEF CON number. Skip archives that are arriving separately, such as a physical DEF CON or BSides delivery, with one filter applied to both HTTP roots and torrents:
+
+```bash
+python infocon_scraper.py \
+  --dest "/path/to/InfoCon drive" \
+  --with-torrents \
+  --skip-recent "DEF CON 34,BSides Las Vegas 2026"
+```
+
+The skip list is intentionally explicit so it can be changed each year when a new DEF CON torrent or physical conference delivery becomes available. The standalone torrent helper accepts the equivalent `--skip` option.
+
 DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and any special folders not represented by torrents.
 
 > The `infocon_scraper.py --fetch-torrent` option shells out to `aria2c`, which only supports BitTorrent v1. DEF CON's per-archive torrents on `media.defcon.org` are v2, so use `fetch_defcon_torrents.py` (libtorrent) for those.
@@ -268,7 +279,7 @@ For a persistent detachable four-pane dashboard, use the local tmux bundle:
 ./tmux-infocon.sh attach -t infocon-monitor
 ```
 
-The panes show the scraper log, a kernel-counter disk dashboard with read/write rate, queue, await, utilization, and merges, a system dashboard with memory/load/CPU/process snapshots, a dedicated network dashboard for RX/TX throughput, packet rates, errors, drops, and sockets, and the detailed status dashboard. The network pane defaults to `eno1`; override it with `INFOCON_NETWORK_INTERFACE`. Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with the same command, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
+The panes show the scraper log, a kernel-counter disk dashboard with read/write rate, queue, await, utilization, and merges, a system dashboard with memory/load/CPU/process snapshots, a dedicated network dashboard for RX/TX throughput, packet rates, errors, drops, and sockets, the HTTP progress dashboard, the torrent progress/state dashboard, and the detailed status dashboard. The network pane defaults to `eno1`; override it with `INFOCON_NETWORK_INTERFACE`. Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with the same command, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
 
 The HTTP manifest is stored at `<destination>/.infocon_manifest.json` by default. Logs can be placed elsewhere with `--log-file`.
 

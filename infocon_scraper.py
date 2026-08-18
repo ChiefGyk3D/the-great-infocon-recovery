@@ -655,7 +655,8 @@ def discover_cons_folders(root_url: str) -> list[str]:
 
 
 def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argparse.Namespace,
-                            ready_event: threading.Event | None = None) -> int:
+                            ready_event: threading.Event | None = None,
+                            skip: list[str] | None = None) -> int:
     """Run the DEF CON torrent fetcher in-process so the single-entry workflow remains simple."""
     try:
         from fetch_defcon_torrents import TorrentSettings, fetch_all
@@ -680,17 +681,21 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
     log.info("Running DEF CON torrent phase into %s ...", torrent_dest)
     return fetch_all(dest=torrent_dest,
                      torrents_dir=os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrents"),
-                     only=only, settings=settings, ready_event=ready_event)
+                     only=only, settings=settings, ready_event=ready_event, skip=skip)
 
 
 def build_infocon_roots(root_url: str, only_cons: list[str] | None,
                         only_top: list[str] | None,
-                        only_mirrors: list[str] | None) -> list[tuple[str, str]]:
+                        only_mirrors: list[str] | None,
+                        skip_cons: list[str] | None = None) -> list[tuple[str, str]]:
     """Build (url, rel_prefix) roots for infocon.org, ordered DEF CON, then BSides, then the rest."""
     cons_names = discover_cons_folders(root_url)
     if only_cons:
         filters = [f.lower() for f in only_cons]
         cons_names = [n for n in cons_names if any(f in n.lower() for f in filters)]
+    if skip_cons:
+        filters = [f.lower() for f in skip_cons]
+        cons_names = [n for n in cons_names if not any(f in n.lower() for f in filters)]
     cons_names.sort(key=lambda n: (conf_priority_rank(n), n.lower()))
 
     roots = [(urljoin(root_url, f"cons/{quote(n)}/"), f"cons/{n}") for n in cons_names]
@@ -789,7 +794,8 @@ def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None,
 
 def build_roots(sources: list[str], infocon_root: str, defcon_media_root: str, defcon_media_skip: set[str] | None,
                  only_cons: list[str] | None, only_top: list[str] | None,
-                 only_mirrors: list[str] | None, skip_torrented: bool = True) -> list[tuple[str, str]]:
+                only_mirrors: list[str] | None, skip_cons: list[str] | None = None,
+                skip_torrented: bool = True) -> list[tuple[str, str]]:
     roots: list[tuple[str, str]] = []
     # media.defcon.org goes first: it's the highest-priority content (DEF CON)
     # and all its roots are submitted for crawling up front, so it shouldn't
@@ -797,7 +803,7 @@ def build_roots(sources: list[str], infocon_root: str, defcon_media_root: str, d
     if "defcon-media" in sources:
         roots += build_defcon_media_roots(defcon_media_root, defcon_media_skip, skip_torrented)
     if "infocon" in sources:
-        roots += build_infocon_roots(infocon_root, only_cons, only_top, only_mirrors)
+        roots += build_infocon_roots(infocon_root, only_cons, only_top, only_mirrors, skip_cons)
     elif "mirrors" in sources:
         roots += build_mirror_roots(infocon_root, only_mirrors)
     return roots
@@ -873,6 +879,9 @@ def main() -> int:
     parser.add_argument("--defcon-media-skip", default=None,
                          help="Comma-separated media.defcon.org folder names to skip entirely, e.g. "
                               "'DEF CON 30,DEF CON 31' when fetching those years via BitTorrent instead")
+    parser.add_argument("--skip-recent", default=None,
+                         help="Comma-separated substrings to skip across InfoCon conferences, media folders, "
+                              "and DEF CON torrents; useful for archives arriving separately")
     parser.add_argument("--no-skip-torrented", action="store_true",
                          help="When 'defcon-media' is a source, do NOT auto-skip folders that already have a "
                               "torrent (by default such folders are skipped so HTTP only fills gaps like DEF CON 34)")
@@ -958,13 +967,17 @@ def main() -> int:
     only_cons = [f.strip() for f in args.only_cons.split(",") if f.strip()] if args.only_cons else None
     only_top = [f.strip() for f in args.only_top.split(",") if f.strip()] if args.only_top else None
     only_mirrors = [f.strip() for f in args.only_mirrors.split(",") if f.strip()] if args.only_mirrors else None
+    skip_recent = [f.strip() for f in args.skip_recent.split(",") if f.strip()] if args.skip_recent else None
     defcon_media_skip = {f.strip() for f in args.defcon_media_skip.split(",") if f.strip()} \
         if args.defcon_media_skip else None
+    if skip_recent:
+        defcon_media_skip = (defcon_media_skip or set()) | set(skip_recent)
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
 
     log.info("Discovering content from sources: %s ...", ", ".join(sources))
     roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip,
-                        only_cons, only_top, only_mirrors, skip_torrented=not args.no_skip_torrented)
+                        only_cons, only_top, only_mirrors, skip_cons=skip_recent,
+                        skip_torrented=not args.no_skip_torrented)
     log.info("Target sections (priority order): %s", ", ".join(rel for _, rel in roots))
     def is_defcon_root(root: tuple[str, str]) -> bool:
         return root[1].lower().startswith("cons/def con")
@@ -1001,7 +1014,7 @@ def main() -> int:
             def run_torrent_phase() -> None:
                 try:
                     torrent_result[0] = run_defcon_torrent_step(
-                        args.dest, torrent_only, args, ready_event=torrent_ready
+                        args.dest, torrent_only, args, ready_event=torrent_ready, skip=skip_recent
                     )
                 except Exception:
                     log.exception("DEF CON torrent phase failed unexpectedly.")

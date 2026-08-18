@@ -167,8 +167,17 @@ def discover_torrents(dir_url: str, settings: TorrentSettings) -> dict[str, str]
     return {base: href for base, (_, href) in best.items()}
 
 
+def torrent_priority(name: str) -> tuple[int, int, str]:
+    """Sort numbered DEF CON archives newest first, then non-numbered items."""
+    match = re.search(r"\b(?:DEF CON|DC)\s+(\d+)\b", name, re.IGNORECASE)
+    if match:
+        return (0, -int(match.group(1)), name.lower())
+    return (1, 0, name.lower())
+
+
 def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
-              settings: TorrentSettings, ready_event: threading.Event | None = None) -> int:
+              settings: TorrentSettings, ready_event: threading.Event | None = None,
+              skip: list[str] | None = None) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
@@ -177,6 +186,10 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
         filters = [f.lower() for f in only]
         available = {name: href for name, href in available.items()
                      if any(f in name.lower() for f in filters)}
+    if skip:
+        filters = [f.lower() for f in skip]
+        available = {name: href for name, href in available.items()
+                     if not any(f in name.lower() for f in filters)}
     if not available:
         print("No matching torrents found.")
         return 1
@@ -190,7 +203,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     handles = {}
     completed_at: dict[str, float] = {}
 
-    for name, href in sorted(available.items()):
+    for name, href in sorted(available.items(), key=lambda item: torrent_priority(item[0])):
         torrent_url = TORRENTS_DIR_URL + href
         torrent_path = os.path.join(torrents_dir, f"{name}.torrent")
         if not os.path.exists(torrent_path):
@@ -269,6 +282,8 @@ def main() -> int:
     parser.add_argument("--only", default=None,
                          help="Comma-separated substrings to restrict which items are fetched "
                               "(default: all available torrents)")
+    parser.add_argument("--skip", default=None,
+                        help="Comma-separated substrings to skip, useful for archives arriving separately")
     parser.add_argument("--torrents-dir", default=DEFAULT_TORRENTS_CACHE,
                          help=f"Where to cache .torrent files (default: {DEFAULT_TORRENTS_CACHE})")
     parser.add_argument("--max-active", type=int, default=8,
@@ -298,6 +313,7 @@ def main() -> int:
         return 2
 
     only = [f.strip() for f in args.only.split(",") if f.strip()] if args.only else None
+    skip = [f.strip() for f in args.skip.split(",") if f.strip()] if args.skip else None
     settings = TorrentSettings(
         max_active=args.max_active,
         connections=args.connections,
@@ -311,7 +327,7 @@ def main() -> int:
         retries=max(0, args.retries),
         retry_delay=max(0, args.retry_delay),
     )
-    return fetch_all(args.dest, args.torrents_dir, only, settings)
+    return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip)
 
 
 if __name__ == "__main__":
