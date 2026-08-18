@@ -192,7 +192,8 @@ def list_directory(url: str) -> list[dict]:
 
 
 def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest", crawl_workers: int,
-             download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event) -> dict[str, int]:
+             download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event,
+             initial_files: list[RemoteFile] | None = None) -> dict[str, int]:
     """Crawl and download at the same time: as soon as a file is discovered it's
     handed to the download pool immediately, instead of waiting for the entire
     site to be crawled first. This is what lets priority roots (DEF CON,
@@ -209,6 +210,8 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
         pending: dict = {}
         for url, rel in roots:
             pending[crawl_pool.submit(list_directory, url)] = ("list", (url, rel))
+        for item in initial_files or []:
+            pending[dl_pool.submit(sync_file, item, dest_root, manifest, verify_all, dry_run)] = ("sync", item)
 
         while pending:
             if stop_requested.is_set():
@@ -374,7 +377,8 @@ def discover_cons_folders(root_url: str) -> list[str]:
 
 
 def build_infocon_roots(root_url: str, only_cons: list[str] | None,
-                        only_top: list[str] | None) -> list[tuple[str, str]]:
+                        only_top: list[str] | None,
+                        only_mirrors: list[str] | None) -> list[tuple[str, str]]:
     """Build (url, rel_prefix) roots for infocon.org, ordered DEF CON, then BSides, then the rest."""
     cons_names = discover_cons_folders(root_url)
     if only_cons:
@@ -389,12 +393,46 @@ def build_infocon_roots(root_url: str, only_cons: list[str] | None,
         filters = [f.lower() for f in only_top]
         sections = [s for s in sections if any(f in s.lower() for f in filters)]
     roots += [(urljoin(root_url, f"{quote(s)}/"), s) for s in sections]
+    if only_mirrors:
+        mirror_filters = [f.lower() for f in only_mirrors]
+        mirror_entries = discover_top_level_folders(urljoin(root_url, "mirrors/"))
+        roots.extend(
+            (urljoin(root_url, f"mirrors/{quote(name)}/"), f"mirrors/{name}")
+            for name in mirror_entries
+            if any(f in name.lower() for f in mirror_filters)
+        )
     return roots
 
 
 def discover_top_level_folders(root_url: str) -> list[str]:
     entries = list_directory(root_url)
     return [e["name"] for e in entries if e["is_dir"]]
+
+
+def discover_mirror_files(root_url: str, filters: list[str] | None) -> list[RemoteFile]:
+    entries = list_directory(urljoin(root_url, "mirrors/"))
+    if not filters:
+        return []
+    lowered = [f.lower() for f in filters]
+    return [
+        RemoteFile(url=urljoin(urljoin(root_url, "mirrors/"), entry["href"]),
+                   rel_path=os.path.join("mirrors", entry["name"]))
+        for entry in entries
+        if not entry["is_dir"]
+        and not entry["name"].lower().endswith(".torrent")
+        and any(f in entry["name"].lower() for f in lowered)
+    ]
+
+
+def build_mirror_roots(root_url: str, filters: list[str] | None) -> list[tuple[str, str]]:
+    if not filters:
+        return [(urljoin(root_url, "mirrors/"), "mirrors")]
+    lowered = [f.lower() for f in filters]
+    return [
+        (urljoin(root_url, f"mirrors/{quote(name)}/"), f"mirrors/{name}")
+        for name in discover_top_level_folders(urljoin(root_url, "mirrors/"))
+        if any(f in name.lower() for f in lowered)
+    ]
 
 
 def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None) -> list[tuple[str, str]]:
@@ -410,7 +448,8 @@ def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None) 
 
 
 def build_roots(sources: list[str], infocon_root: str, defcon_media_root: str, defcon_media_skip: set[str] | None,
-                 only_cons: list[str] | None, only_top: list[str] | None) -> list[tuple[str, str]]:
+                 only_cons: list[str] | None, only_top: list[str] | None,
+                 only_mirrors: list[str] | None) -> list[tuple[str, str]]:
     roots: list[tuple[str, str]] = []
     # media.defcon.org goes first: it's the highest-priority content (DEF CON)
     # and all its roots are submitted for crawling up front, so it shouldn't
@@ -418,7 +457,9 @@ def build_roots(sources: list[str], infocon_root: str, defcon_media_root: str, d
     if "defcon-media" in sources:
         roots += build_defcon_media_roots(defcon_media_root, defcon_media_skip)
     if "infocon" in sources:
-        roots += build_infocon_roots(infocon_root, only_cons, only_top)
+        roots += build_infocon_roots(infocon_root, only_cons, only_top, only_mirrors)
+    elif "mirrors" in sources:
+        roots += build_mirror_roots(infocon_root, only_mirrors)
     return roots
 
 
@@ -475,14 +516,18 @@ def main() -> int:
     parser.add_argument("--defcon-media-url", default=DEFCON_MEDIA_ROOT_URL,
                          help="Root URL of media.defcon.org (DEF CON's own authoritative media server)")
     parser.add_argument("--sources", default="infocon,defcon-media",
-                         help="Comma-separated sources to sync: 'infocon' (everything on infocon.org) and/or "
-                              "'defcon-media' (media.defcon.org, DEF CON only). Default: both.")
+                        help="Comma-separated sources to sync: 'infocon' (everything on infocon.org), "
+                            "'mirrors' (only infocon.org/mirrors), and/or 'defcon-media' "
+                            "(media.defcon.org, DEF CON only). Default: both infocon and defcon-media.")
     parser.add_argument("--only-cons", default=None,
                          help="Comma-separated substrings to restrict which infocon.org cons/ conferences are "
                               "synced (default: all conferences)")
     parser.add_argument("--only-top", default=None,
                          help="Comma-separated substrings to restrict which infocon.org top-level sections "
                               "besides cons/ are synced, e.g. 'documentaries,podcasts' (default: all sections)")
+    parser.add_argument("--only-mirrors", default=None,
+                         help="Comma-separated mirror name filters, e.g. 'cryptome,textfiles'; downloads only "
+                              "matching collections under infocon.org/mirrors/")
     parser.add_argument("--defcon-media-skip", default=None,
                          help="Comma-separated media.defcon.org folder names to skip entirely, e.g. "
                               "'DEF CON 30,DEF CON 31' when fetching those years via BitTorrent instead")
@@ -534,12 +579,14 @@ def main() -> int:
 
     only_cons = [f.strip() for f in args.only_cons.split(",") if f.strip()] if args.only_cons else None
     only_top = [f.strip() for f in args.only_top.split(",") if f.strip()] if args.only_top else None
+    only_mirrors = [f.strip() for f in args.only_mirrors.split(",") if f.strip()] if args.only_mirrors else None
     defcon_media_skip = {f.strip() for f in args.defcon_media_skip.split(",") if f.strip()} \
         if args.defcon_media_skip else None
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
 
     log.info("Discovering content from sources: %s ...", ", ".join(sources))
-    roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip, only_cons, only_top)
+    roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip,
+                        only_cons, only_top, only_mirrors)
     log.info("Target sections (priority order): %s", ", ".join(rel for _, rel in roots))
     manifest = Manifest(manifest_path)
 
@@ -551,9 +598,12 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, handle_sigint)
 
+    initial_files = discover_mirror_files(args.base_url, only_mirrors) \
+        if "infocon" in sources or "mirrors" in sources else []
+
     try:
         counts = run_sync(roots, args.dest, manifest, args.crawl_workers, args.workers,
-                           args.verify_all, args.dry_run, stop_requested)
+                           args.verify_all, args.dry_run, stop_requested, initial_files)
     finally:
         manifest.save()
 

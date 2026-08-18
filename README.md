@@ -15,6 +15,71 @@ This project is licensed under the GNU General Public License v3.0. See [LICENSE
 
 The enormous `mirrors/` tree is excluded by default because repositories such as vx-underground can consume an entire disk. Include it explicitly with `--only-top mirrors`.
 
+### InfoCon Mirrors
+
+`https://infocon.org/mirrors/` contains independent historical or community archive collections. The current top-level listing includes:
+
+| Collection | Approximate listed size | Transfer options |
+| --- | ---: | --- |
+| Cryptome.org snapshot | 85.7 GiB | HTTP or v1/v2 archive torrent |
+| Gutenberg.net.au snapshot | 8.1 GiB | HTTP or v1/v2 archive torrent |
+| textfiles.com 2011 | 13.0 GiB | HTTP or torrent |
+| Internet Census 2012 | Directory plus v1/v2 torrents | HTTP or torrent |
+| PoCGTFO | Directory | HTTP |
+| vx-underground 2024/2025 | Very large malware-sample archives | Torrent or HTTP; plan storage carefully |
+| hackcanada.com | 641.8 MiB | HTTP |
+| nettwerked.net | 1023.3 MiB | HTTP |
+
+Sizes and availability can change. Check the live listing before starting a large transfer. The mirror archives are independent collections, not alternate copies of the normal `cons/` conference folders.
+
+### DDV Source-Drive Relationship
+
+The public DDV historical briefings identify the five-source model used for recent DEF CON duplications as:
+
+1. InfoCon.org archive
+2. Rainbow Tables 1 of 3
+3. Rainbow Tables 2 of 3
+4. Rainbow Tables 3 of 3
+5. VX Underground Archive
+
+That means the `mirrors/vx underground - 2025 June/` collection is directly relevant to recreating a DDV source drive. The other mirror collections listed above are useful independent archives, but they are not identified in the DDV briefings as part of those five source drives. The Rainbow Tables source is under the normal top-level `rainbow tables/` section, not under `mirrors/`.
+
+To target the DDV-related mirror collection without crawling every conference:
+
+```bash
+python infocon_scraper.py --dest "/path/to/drive" \
+  --sources mirrors --only-mirrors "vx underground"
+```
+
+To acquire the DDV-style InfoCon plus Rainbow Tables sources in separate destination trees, run separate jobs or use separate destination roots. Do not combine them into one flat folder if the goal is to reproduce the source-drive layout.
+
+Download one or more selected mirror collections while preserving their nested layout:
+
+```bash
+# One collection
+python infocon_scraper.py --dest "/path/to/drive" \
+  --sources mirrors --only-mirrors cryptome
+
+# Several collections by case-insensitive substring
+python infocon_scraper.py --dest "/path/to/drive" \
+  --sources mirrors --only-mirrors "textfiles,gutenberg"
+
+# Preview the selected mirror transfer
+python infocon_scraper.py --dest "/path/to/drive" \
+  --sources mirrors --only-mirrors cryptome --dry-run
+```
+
+`--only-mirrors` filters mirror collection names; `--sources mirrors` prevents the command from also crawling the conference archive. To sync the normal InfoCon archive and selected mirrors in one run, use `--sources infocon --only-mirrors ...`.
+
+Mirror files are written below `mirrors/<collection>/`. For collections with a published `.torrent`, prefer the torrent when available: it provides piece-level verification and resumes efficiently. Do not enable the whole mirrors tree casually:
+
+```bash
+# This includes every mirror collection and can require multiple terabytes.
+python infocon_scraper.py --dest "/path/to/drive" --only-top mirrors
+```
+
+The scraper intentionally does not auto-extract `.rar` archives. It preserves the archive exactly as published and skips an archive when an unpacked folder with the same base name already exists locally, preventing duplicate storage.
+
 `fetch_defcon_torrents.py` discovers the per-archive torrents in `media.defcon.org/DEF%20CON%20Torrents/` and uses `libtorrent` to verify and fill gaps. The torrent's own internal folder name determines the destination, so existing folders are reused instead of duplicated.
 
 ## Requirements
