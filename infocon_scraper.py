@@ -115,6 +115,140 @@ class RunConfig:
 RUN = RunConfig()
 
 
+def human_bytes(n: float) -> str:
+    """Compact human-readable byte count, e.g. 12.3 MB."""
+    step = 1000.0
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < step or unit == "PB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= step
+    return f"{n:.1f} PB"
+
+
+def format_duration(seconds: float) -> str:
+    """Compact H:MM:SS / M:SS duration, or '--' when unknown."""
+    if seconds <= 0 or seconds != seconds or seconds == float("inf"):
+        return "--"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def progress_bar(fraction: float, width: int = 24) -> str:
+    """ASCII progress bar like [########----------------]."""
+    fraction = 0.0 if fraction < 0 else (1.0 if fraction > 1 else fraction)
+    filled = int(round(fraction * width))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+class ProgressStats:
+    """Thread-safe aggregate counters shared between the download workers and
+    the status reporter thread."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.start = time.time()
+        self.discovered = 0
+        self.completed = 0
+        self.downloaded_files = 0
+        self.downloaded_bytes = 0
+        self.skipped = 0
+        self.errors = 0
+        self.active = 0
+
+    def add_discovered(self, n: int = 1) -> None:
+        with self.lock:
+            self.discovered += n
+
+    def download_started(self) -> None:
+        with self.lock:
+            self.active += 1
+
+    def download_finished(self, status: str, nbytes: int) -> None:
+        with self.lock:
+            self.active = max(0, self.active - 1)
+            self.completed += 1
+            if status == "downloaded":
+                self.downloaded_files += 1
+                self.downloaded_bytes += nbytes
+            elif status.startswith("error"):
+                self.errors += 1
+            elif status.startswith("skip") or status == "baseline-recorded":
+                self.skipped += 1
+
+    def snapshot(self) -> dict[str, float]:
+        with self.lock:
+            return {
+                "discovered": self.discovered,
+                "completed": self.completed,
+                "downloaded_files": self.downloaded_files,
+                "downloaded_bytes": self.downloaded_bytes,
+                "skipped": self.skipped,
+                "errors": self.errors,
+                "active": self.active,
+            }
+
+
+class StatusReporter(threading.Thread):
+    """Periodically emits an aggregate progress line (bar, counts, speed, ETA).
+    Renders a live single-line bar when stdout is a TTY, and always logs a
+    snapshot line so `tail -f` on the log shows progress too."""
+
+    def __init__(self, stats: ProgressStats, interval: float = 10.0) -> None:
+        super().__init__(daemon=True)
+        self.stats = stats
+        self.interval = max(1.0, interval)
+        self._stop_event = threading.Event()
+        self.is_tty = sys.stdout.isatty()
+        self._last_time = stats.start
+        self._last_bytes = 0
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def run(self) -> None:
+        while not self._stop_event.wait(self.interval):
+            self._emit()
+        self._emit(final=True)
+
+    def _emit(self, final: bool = False) -> None:
+        s = self.stats.snapshot()
+        now = time.time()
+        elapsed = now - self.stats.start
+        window = now - self._last_time
+        cur_rate = (s["downloaded_bytes"] - self._last_bytes) / window if window > 0 else 0.0
+        avg_rate = s["downloaded_bytes"] / elapsed if elapsed > 0 else 0.0
+        self._last_time = now
+        self._last_bytes = s["downloaded_bytes"]
+
+        discovered = s["discovered"]
+        completed = s["completed"]
+        fraction = (completed / discovered) if discovered else 0.0
+        comp_rate = completed / elapsed if elapsed > 0 else 0.0
+        remaining = max(discovered - completed, 0)
+        eta = remaining / comp_rate if comp_rate > 0 else 0.0
+
+        line = (
+            f"{progress_bar(fraction)} {completed}/{discovered} ({fraction * 100:4.1f}%) | "
+            f"dl {int(s['downloaded_files'])} files {human_bytes(s['downloaded_bytes'])} "
+            f"@ {human_bytes(cur_rate)}/s (avg {human_bytes(avg_rate)}/s) | "
+            f"skip {int(s['skipped'])} err {int(s['errors'])} | act {int(s['active'])} | "
+            f"{format_duration(elapsed)} elapsed, ETA {format_duration(eta)}"
+        )
+
+        if self.is_tty and not final:
+            sys.stdout.write("\r" + line)
+            sys.stdout.flush()
+        else:
+            if self.is_tty:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            log.info(line)
+
+
 def has_free_space(directory: str, needed: int) -> bool:
     """True if directory's filesystem can hold `needed` bytes plus the safety margin."""
     try:
@@ -291,7 +425,8 @@ def list_directory(url: str) -> list[dict]:
 def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest", crawl_workers: int,
              download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event,
              initial_files: list[RemoteFile] | None = None,
-             max_pending_downloads: int | None = None) -> dict[str, int]:
+             max_pending_downloads: int | None = None,
+             stats: "ProgressStats | None" = None) -> dict[str, int]:
     """Crawl and download at the same time: as soon as a file is discovered it's
     handed to the download pool immediately, instead of waiting for the entire
     site to be crawled first. This is what lets priority roots (DEF CON,
@@ -303,6 +438,9 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
     discovered = 0
     completed = 0
     ready_files = deque(initial_files or [])
+    if initial_files and stats:
+        stats.add_discovered(len(initial_files))
+    discovered += len(initial_files or [])
     pending_downloads = 0
     download_limit = max_pending_downloads or max(download_workers * 4, download_workers)
 
@@ -336,17 +474,21 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                         else:
                             item = RemoteFile(url=child_url, rel_path=child_rel)
                             discovered += 1
+                            if stats:
+                                stats.add_discovered()
                             ready_files.append(item)
                 else:
                     item = payload
                     pending_downloads -= 1
                     try:
-                        result = fut.result()
+                        result, nbytes = fut.result()
                     except Exception as exc:  # noqa: BLE001 - log and continue
                         log.error("Unexpected error for %s: %s", item.rel_path, exc)
-                        result = "error"
+                        result, nbytes = "error", 0
                     counts[result] = counts.get(result, 0) + 1
                     completed += 1
+                    if stats:
+                        stats.download_finished(result, nbytes)
                     if result == "error-diskfull":
                         log.error("Halting: destination filesystem is full.")
                         stop_requested.set()
@@ -360,6 +502,8 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                 pending[dl_pool.submit(sync_file, item, dest_root, manifest, verify_all, dry_run)] = \
                     ("sync", item)
                 pending_downloads += 1
+                if stats:
+                    stats.download_started()
 
             if not pending and ready_files:
                 log.error("Stopping with %d discovered files still queued", len(ready_files))
@@ -419,19 +563,19 @@ def is_unpacked_archive_duplicate(local_path: str) -> bool:
 
 
 def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
-              verify_all: bool, dry_run: bool) -> str:
+              verify_all: bool, dry_run: bool) -> tuple[str, int]:
     local_path = os.path.join(dest_root, item.rel_path)
     rel = item.rel_path
 
     if is_unpacked_archive_duplicate(local_path):
         log.info("Skipping %s (already have the unpacked folder)", rel)
-        return "skip-duplicate-archive"
+        return "skip-duplicate-archive", 0
 
     try:
         remote_size = curl_head_size(item.url)
     except CurlError as exc:
         log.error("HEAD failed for %s: %s", item.url, exc)
-        return "error"
+        return "error", 0
 
     exists = os.path.exists(local_path)
     local_size = os.path.getsize(local_path) if exists else 0
@@ -439,18 +583,18 @@ def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
     if exists and remote_size is not None and local_size == remote_size:
         entry = manifest.get(rel)
         if entry and entry.get("size") == remote_size and not verify_all:
-            return "skip-known-good"
+            return "skip-known-good", 0
         digest = sha256_file(local_path)
         if entry and entry.get("sha256") == digest:
             manifest.set(rel, {"size": remote_size, "sha256": digest, "url": item.url,
                                 "verified": time.time()})
-            return "skip-verified"
+            return "skip-verified", 0
         if entry and entry.get("sha256") != digest:
             log.warning("Corruption detected for %s (hash mismatch), re-downloading", rel)
         else:
             manifest.set(rel, {"size": remote_size, "sha256": digest, "url": item.url,
                                 "verified": time.time()})
-            return "baseline-recorded"
+            return "baseline-recorded", 0
 
     part_path = local_path + ".part"
     part_size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
@@ -459,7 +603,7 @@ def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
         resuming = remote_size and (0 < local_size < remote_size or 0 < part_size < remote_size)
         action = "would-resume" if resuming else "would-download"
         log.info("[dry-run] %s -> %s", action, rel)
-        return action
+        return action, 0
 
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
@@ -467,23 +611,23 @@ def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
     needed = (remote_size - part_size) if (remote_size and part_size < remote_size) else (remote_size or 0)
     if remote_size and not has_free_space(os.path.dirname(local_path) or ".", needed):
         log.error("Insufficient free space for %s (needs ~%d bytes)", rel, needed)
-        return "error-diskfull"
+        return "error-diskfull", 0
 
     try:
         download_atomic(item.url, local_path, remote_size)
     except CurlError as exc:
         log.error("Download failed for %s: %s", item.url, exc)
-        return "error"
+        return "error", 0
 
     final_size = os.path.getsize(local_path)
     if remote_size is not None and final_size != remote_size:
         log.error("Size mismatch after download for %s (got %d, expected %d)", rel, final_size, remote_size)
-        return "error"
+        return "error", 0
 
     digest = sha256_file(local_path)
     manifest.set(rel, {"size": final_size, "sha256": digest, "url": item.url, "verified": time.time()})
     log.info("Downloaded %s (%d bytes)", rel, final_size)
-    return "downloaded"
+    return "downloaded", final_size
 
 
 def conf_priority_rank(name: str) -> int:
@@ -699,6 +843,8 @@ def main() -> int:
     parser.add_argument("--max-pending-downloads", type=int, default=None,
                          help="Maximum queued/in-flight file downloads (default: workers * 4)")
     parser.add_argument("--crawl-workers", type=int, default=16, help="Concurrent directory-listing workers")
+    parser.add_argument("--status-interval", type=float, default=10.0,
+                         help="Seconds between progress/speed status lines (default: 10; 0 disables)")
     parser.add_argument("--retries", type=int, default=4,
                          help="Per-file download attempts before giving up (default: 4)")
     parser.add_argument("--download-timeout", type=int, default=3600,
@@ -786,15 +932,30 @@ def main() -> int:
     initial_files = discover_mirror_files(args.base_url, only_mirrors) \
         if "infocon" in sources or "mirrors" in sources else []
 
+    stats = ProgressStats()
+    reporter = StatusReporter(stats, args.status_interval) if args.status_interval > 0 else None
+    if reporter:
+        reporter.start()
+
     try:
         counts = run_sync(roots, args.dest, manifest, args.crawl_workers, args.workers,
                            args.verify_all, args.dry_run, stop_requested, initial_files,
-                           args.max_pending_downloads)
+                           args.max_pending_downloads, stats)
     finally:
+        if reporter:
+            reporter.stop()
+            reporter.join(timeout=args.status_interval + 2)
         manifest.save()
         release_lock(lock_path)
 
-    log.info("Done. Summary: %s", json.dumps(counts, indent=2))
+    final = stats.snapshot()
+    elapsed = time.time() - stats.start
+    avg_rate = final["downloaded_bytes"] / elapsed if elapsed > 0 else 0.0
+    log.info("Done in %s. Downloaded %d files (%s) at %s/s avg; %d skipped, %d errors.",
+             format_duration(elapsed), int(final["downloaded_files"]),
+             human_bytes(final["downloaded_bytes"]), human_bytes(avg_rate),
+             int(final["skipped"]), int(final["errors"]))
+    log.info("Summary: %s", json.dumps(counts, indent=2))
     return 1 if counts.get("error") else 0
 
 
