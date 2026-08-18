@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.torrents-cache/
+run.out
+torrent.out
+*.log
+*.torrent
+.infocon_manifest.json
