@@ -220,7 +220,7 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                     url, rel = payload
                     try:
                         entries = fut.result()
-                    except CurlError as exc:
+                    except Exception as exc:  # noqa: BLE001 - a single bad listing must not kill the whole crawl
                         log.error("Failed to list %s: %s", url, exc)
                         continue
                     log.info("Listed %s (%d entries)", url, len(entries))
@@ -499,7 +499,8 @@ def main() -> int:
     parser.add_argument("--fetch-torrent", metavar="NAME",
                          help="Instead of syncing, download the latest matching .torrent under infocon.org/cons/ "
                               "(e.g. 'DEF CON') and hand it to aria2c to fetch into --dest/torrents-download/NAME, "
-                              "then exit")
+                              "then exit. Note: aria2c only supports BitTorrent v1; for DEF CON's v2 torrents on "
+                              "media.defcon.org use fetch_defcon_torrents.py instead")
     args = parser.parse_args()
 
     if args.list_torrents:
