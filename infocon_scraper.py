@@ -56,6 +56,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urljoin, urlparse
@@ -193,7 +194,8 @@ def list_directory(url: str) -> list[dict]:
 
 def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest", crawl_workers: int,
              download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event,
-             initial_files: list[RemoteFile] | None = None) -> dict[str, int]:
+             initial_files: list[RemoteFile] | None = None,
+             max_pending_downloads: int | None = None) -> dict[str, int]:
     """Crawl and download at the same time: as soon as a file is discovered it's
     handed to the download pool immediately, instead of waiting for the entire
     site to be crawled first. This is what lets priority roots (DEF CON,
@@ -204,21 +206,24 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
     counts: dict[str, int] = {}
     discovered = 0
     completed = 0
+    ready_files = deque(initial_files or [])
+    pending_downloads = 0
+    download_limit = max_pending_downloads or max(download_workers * 4, download_workers)
 
     with ThreadPoolExecutor(max_workers=crawl_workers) as crawl_pool, \
             ThreadPoolExecutor(max_workers=download_workers) as dl_pool:
         pending: dict = {}
         for url, rel in roots:
             pending[crawl_pool.submit(list_directory, url)] = ("list", (url, rel))
-        for item in initial_files or []:
-            pending[dl_pool.submit(sync_file, item, dest_root, manifest, verify_all, dry_run)] = ("sync", item)
-
         while pending:
             if stop_requested.is_set():
                 break
             done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
             for fut in done:
-                kind, payload = pending.pop(fut)
+                kind, payload = pending[fut]
+                if kind == "list" and pending_downloads >= download_limit:
+                    continue
+                pending.pop(fut)
                 if kind == "list":
                     url, rel = payload
                     try:
@@ -235,10 +240,10 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                         else:
                             item = RemoteFile(url=child_url, rel_path=child_rel)
                             discovered += 1
-                            pending[dl_pool.submit(sync_file, item, dest_root, manifest, verify_all, dry_run)] = \
-                                ("sync", item)
+                            ready_files.append(item)
                 else:
                     item = payload
+                    pending_downloads -= 1
                     try:
                         result = fut.result()
                     except Exception as exc:  # noqa: BLE001 - log and continue
@@ -248,6 +253,16 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                     completed += 1
                     if completed % 25 == 0:
                         log.info("Progress: %d files completed (%d discovered so far)", completed, discovered)
+
+            while ready_files and pending_downloads < download_limit:
+                item = ready_files.popleft()
+                pending[dl_pool.submit(sync_file, item, dest_root, manifest, verify_all, dry_run)] = \
+                    ("sync", item)
+                pending_downloads += 1
+
+            if not pending and ready_files:
+                log.error("Stopping with %d discovered files still queued", len(ready_files))
+                break
 
     log.info("Progress: %d files completed (%d discovered total)", completed, discovered)
     return counts
@@ -532,6 +547,8 @@ def main() -> int:
                          help="Comma-separated media.defcon.org folder names to skip entirely, e.g. "
                               "'DEF CON 30,DEF CON 31' when fetching those years via BitTorrent instead")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent download workers")
+    parser.add_argument("--max-pending-downloads", type=int, default=None,
+                         help="Maximum queued/in-flight file downloads (default: workers * 4)")
     parser.add_argument("--crawl-workers", type=int, default=16, help="Concurrent directory-listing workers")
     parser.add_argument("--verify-all", action="store_true",
                          help="Re-hash every existing file in scope, not just new ones")
@@ -603,7 +620,8 @@ def main() -> int:
 
     try:
         counts = run_sync(roots, args.dest, manifest, args.crawl_workers, args.workers,
-                           args.verify_all, args.dry_run, stop_requested, initial_files)
+                           args.verify_all, args.dry_run, stop_requested, initial_files,
+                           args.max_pending_downloads)
     finally:
         manifest.save()
 

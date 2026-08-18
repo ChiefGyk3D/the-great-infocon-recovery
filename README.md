@@ -139,7 +139,7 @@ python infocon_scraper.py --dest "/path/to/drive" --verify-all
 python infocon_scraper.py --dest "/path/to/drive" --dry-run
 ```
 
-The HTTP scraper uses separate directory-listing and download worker pools. It streams work as directories are discovered, so later large trees do not block priority content. Requests to `media.defcon.org` are capped to avoid server throttling.
+The HTTP scraper uses separate directory-listing and download worker pools. It streams work as directories are discovered, so later large trees do not block priority content. Requests to `media.defcon.org` are capped to avoid server throttling. Download scheduling is bounded so very large trees do not create hundreds of thousands of in-memory futures.
 
 Tune HTTP concurrency for a particular machine or network:
 
@@ -147,6 +147,10 @@ Tune HTTP concurrency for a particular machine or network:
 # More directory listings, fewer downloads
 python infocon_scraper.py --dest "/path/to/drive" \
   --crawl-workers 24 --workers 4
+
+# Bound queued/in-flight downloads; default is workers * 4
+python infocon_scraper.py --dest "/path/to/drive" \
+  --workers 8 --max-pending-downloads 32
 
 # Fewer connections for a throttled host or slower disk
 python infocon_scraper.py --dest "/path/to/drive" \
