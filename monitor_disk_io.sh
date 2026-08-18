@@ -48,7 +48,9 @@ while :; do
     printf 'util:   %s.%s%% busy\n' "$((util_tenths / 10))" "$((util_tenths % 10))"
     printf 'merged: read=%s  write=%s\n' "$((current_merges - previous_merges))" \
         "$((current_write_merges - previous_write_merges))"
-    printf 'sectors: read=%s  write=%s\n' "$current_read_sectors" "$current_write_sectors"
+    printf 'since boot: read=%s  written=%s\n' \
+        "$(numfmt --to=iec $((current_read_sectors * 512)))" \
+        "$(numfmt --to=iec $((current_write_sectors * 512)))"
 
     previous_reads=$current_reads
     previous_merges=$current_merges

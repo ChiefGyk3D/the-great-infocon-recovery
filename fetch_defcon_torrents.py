@@ -249,7 +249,9 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                         h.pause()
                 else:
                     active.append((s.download_rate, s.progress, s.num_peers, str(s.state), name))
-            active.sort(reverse=True)  # highest download rate first
+            # Highest download rate first; ties break newest-DEF-CON-first instead of
+            # alphabetically (plain string sort would put "DEF CON 2" ahead of "19").
+            active.sort(key=lambda item: (-item[0], -item[1], -item[2], torrent_priority(item[4])))
             total_rate = sum(a[0] for a in active)
             downloading = sum(1 for a in active if a[0] > 0)
             print(f"--- {done}/{len(handles)} complete | {total_rate / 1e6:6.2f} MB/s total | "

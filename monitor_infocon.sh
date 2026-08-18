@@ -35,13 +35,7 @@ while :; do
         if [[ -n "$inode_available_percent" ]] && awk "BEGIN {exit !($inode_available_percent < 5)}"; then
             printf 'ALERT: less than 5%% inodes available\n'
         fi
-        printf 'Cache: torrent metadata %s at %s\n' "$(size_for_path "$TORRENT_CACHE")" "$TORRENT_CACHE"
-        part_probe=$(timeout 2s find "$DEST" -type f -name '*.part' -print -quit 2>/dev/null || true)
-        if [[ -n "$part_probe" ]]; then
-            printf 'HTTP staging: .part files present (bounded probe; full scan disabled)\n'
-        else
-            printf 'HTTP staging: no .part file found by bounded probe\n'
-        fi
+        printf 'Torrent cache: %s at %s\n' "$(size_for_path "$TORRENT_CACHE")" "$TORRENT_CACHE"
         printf 'Load: %s\n' "$(uptime | sed 's/.*load average: //')"
         free -h | awk '/^Mem:/ {printf "Memory: %s used / %s available\n", $3, $7}'
         if [[ -f "$DEST/.infocon_scraper.lock" ]]; then
