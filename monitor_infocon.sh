@@ -27,17 +27,13 @@ while :; do
         fi
         space_available_bytes=$(df -P -B1 "$DEST" 2>/dev/null | awk 'NR == 2 {print $4}')
         inode_available_percent=$(df -P -i "$DEST" 2>/dev/null | awk 'NR == 2 {gsub("%", "", $5); print 100 - $5}')
-        printf '\n'
-        df -h "$DEST" 2>/dev/null
-        df -h -i "$DEST" 2>/dev/null
-        printf '\n'
         if [[ -n "$space_available_bytes" && "$space_available_bytes" -lt $((100 * 1024 * 1024 * 1024)) ]]; then
             printf 'ALERT: less than 100 GiB free on destination\n'
         fi
         if [[ -n "$inode_available_percent" ]] && awk "BEGIN {exit !($inode_available_percent < 5)}"; then
             printf 'ALERT: less than 5%% inodes available\n'
         fi
-        printf 'Torrent cache: %s  Load: %s\n' "$(size_for_path "$TORRENT_CACHE")" "$(uptime | sed 's/.*load average: //')"
+        printf 'Torrent cache (metadata only): %s  Load: %s\n' "$(size_for_path "$TORRENT_CACHE")" "$(uptime | sed 's/.*load average: //')"
         free -h | awk '/^Mem:/ {printf "Memory: %s used / %s available\n", $3, $7}'
 
         printf '\nWorker:\n'

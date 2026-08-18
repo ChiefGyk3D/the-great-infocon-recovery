@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
+DEST="${INFOCON_DEST:-/media/chiefgyk3d/infocon.org DC30}"
 INTERVAL=${1:-10}
 while :; do
     read -r _ _ _ _ _ _ _ _ _ _ _ _ us sy id wa st <<< "$(vmstat 1 2 | tail -n 1)"
@@ -9,9 +10,11 @@ while :; do
     printf 'Load: %s\n' "$(uptime | sed 's/.*load average: //')"
     free -h | awk '/^Mem:/ {printf "Memory: %s used / %s available\n", $3, $7}
                    /^Swap:/ {printf "Swap:   %s used / %s available\n", $3, $4}'
-    printf 'CPU: us=%s%% sy=%s%% id=%s%% wa=%s%% st=%s%%\n' "$us" "$sy" "$id" "$wa" "$st"
+    printf 'CPU: us=%s%% sy=%s%% id=%s%% wa=%s%% st=%s%%\n\n' "$us" "$sy" "$id" "$wa" "$st"
+    printf 'Disk (%s):\n' "$DEST"
+    df -h "$DEST" 2>/dev/null
     printf '\nTop processes (CPU + MEM together):\n'
-    ps -eo pid,comm,%cpu,%mem,nlwp,rss --sort=-%cpu | head -n 9
+    ps -eo pid,comm,%cpu,%mem,nlwp,rss --sort=-%cpu | head -n 8
     sleep "$INTERVAL"
 done
 
