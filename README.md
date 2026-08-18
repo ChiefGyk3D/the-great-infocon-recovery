@@ -264,22 +264,34 @@ pgrep -fa 'infocon_scraper.py|fetch_defcon_torrents.py'
 df -h "/path/to/drive"
 ```
 
-For a detached dashboard with scraper status, lock ownership, network throughput, disk I/O, free space, and recent log output:
+For a detached overview with mount health, free-space/inode alerts, torrent cache size, worker CPU/memory/threads/fds/disk I/O, and recent errors:
 
 ```bash
 nohup ./monitor_infocon.sh > monitor-daemon.log 2>&1 &
 tail -f infocon-monitor.out
 ```
 
-The monitor defaults to `/media/chiefgyk3d/infocon.org DC30` and `eno1`. Override them with `INFOCON_DEST`, `INFOCON_NETWORK_INTERFACE`, `INFOCON_MONITOR_INTERVAL`, or `INFOCON_MONITOR_OUTPUT`. Stop the dashboard with `pkill -f monitor_infocon.sh`; stopping it does not stop the scraper.
+The overview defaults to `/media/chiefgyk3d/infocon.org DC30`. Override it with `INFOCON_DEST`, `INFOCON_MONITOR_INTERVAL`, `INFOCON_MONITOR_OUTPUT`, or `INFOCON_TORRENT_CACHE`. Stop it with `pkill -f monitor_infocon.sh`; stopping it does not stop the scraper.
 
-For a persistent detachable four-pane dashboard, use the local tmux bundle:
+For a persistent detachable six-pane dashboard, start it once with the setup script, which creates the tmux session and starts the overview daemon above if it isn't already running:
 
 ```bash
+./start-dashboard.sh
 ./tmux-infocon.sh attach -t infocon-monitor
 ```
 
-The panes show the scraper log, a kernel-counter disk dashboard with read/write rate, queue, await, utilization, and merges, a system dashboard with memory/load/CPU/process snapshots, a dedicated network dashboard for RX/TX throughput, packet rates, errors, drops, and sockets, the HTTP progress dashboard, the torrent progress/state dashboard, and the detailed status dashboard. The network pane defaults to `eno1`; override it with `INFOCON_NETWORK_INTERFACE`. Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with the same command, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
+The panes are:
+
+| Pane | Script | Shows |
+| --- | --- | --- |
+| Scraper log | `tail -F run.out` | Raw HTTP/torrent log output |
+| System | `monitor_system.sh` | Load, memory, swap, CPU breakdown, destination disk usage (`df -h`), top processes by CPU/memory |
+| Network I/O | `monitor_network_io.sh` | RX/TX throughput, packet rates, errors, drops, socket counts, per-process socket/state attribution |
+| Disk I/O | `monitor_disk_io.sh` | Kernel-counter read/write rates, queue depth, await, utilization, merges, since-boot totals |
+| HTTP status | `monitor_http_status.sh` | Live progress bar, discovered/downloaded/skipped/error counts, `.part` staging probe, recent HTTP failures |
+| BitTorrent status | `monitor_torrent_status.sh` | Active downloads always shown in full; checking/queued torrents truncated with a remaining count; state-count summary |
+
+The overview pane just tails a snapshot file (`infocon-monitor.out`) written by the separate `monitor_infocon.sh` daemon, so that daemon must be running for the overview pane to show live data; `start-dashboard.sh` starts it automatically if it isn't already. The network and disk panes default to `eno1` and `sdc`; `start-dashboard.sh` reads `INFOCON_NETWORK_INTERFACE` and `INFOCON_DISK_DEVICE` and passes them through. Running `monitor_network_io.sh` or `monitor_disk_io.sh` directly instead takes the interface/device as a positional argument, e.g. `./monitor_disk_io.sh nvme0n1 10`. The torrent pane truncates checking/queued entries at `INFOCON_TORRENT_MAX_IDLE_LINES` (default 10). Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with `./tmux-infocon.sh attach -t infocon-monitor`, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
 
 The HTTP manifest is stored at `<destination>/.infocon_manifest.json` by default. Logs can be placed elsewhere with `--log-file`.
 
