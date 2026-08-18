@@ -115,6 +115,14 @@ class RunConfig:
 RUN = RunConfig()
 
 
+def shared_drive_lock_path(dest: str) -> str:
+    """Maps both the HTTP root and the DEF CON torrent dest to the same drive-level lock file."""
+    path = os.path.abspath(dest)
+    if os.path.basename(path) == "DEF CON" and os.path.basename(os.path.dirname(path)) == "cons":
+        path = os.path.dirname(os.path.dirname(path))
+    return os.path.join(path, ".infocon_scraper.lock")
+
+
 def human_bytes(n: float) -> str:
     """Compact human-readable byte count, e.g. 12.3 MB."""
     step = 1000.0
@@ -646,6 +654,35 @@ def discover_cons_folders(root_url: str) -> list[str]:
     return [e["name"] for e in entries if e["is_dir"]]
 
 
+def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argparse.Namespace,
+                            ready_event: threading.Event | None = None) -> int:
+    """Run the DEF CON torrent fetcher in-process so the single-entry workflow remains simple."""
+    try:
+        from fetch_defcon_torrents import TorrentSettings, fetch_all
+    except Exception as exc:  # pragma: no cover - depends on optional libtorrent install
+        log.error("Could not import the torrent helper: %s", exc)
+        return 1
+
+    torrent_dest = os.path.join(dest_root, "cons", "DEF CON")
+    settings = TorrentSettings(
+        max_active=args.torrent_max_active,
+        connections=args.torrent_connections,
+        listen_interface="0.0.0.0:6881",
+        poll_seconds=args.torrent_poll_seconds,
+        seed_time=args.torrent_seed_time,
+        enable_dht=True,
+        enable_pex=True,
+        enable_lsd=True,
+        request_timeout=120,
+        retries=3,
+        retry_delay=3,
+    )
+    log.info("Running DEF CON torrent phase into %s ...", torrent_dest)
+    return fetch_all(dest=torrent_dest,
+                     torrents_dir=os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrents"),
+                     only=only, settings=settings, ready_event=ready_event)
+
+
 def build_infocon_roots(root_url: str, only_cons: list[str] | None,
                         only_top: list[str] | None,
                         only_mirrors: list[str] | None) -> list[tuple[str, str]]:
@@ -856,6 +893,17 @@ def main() -> int:
     parser.add_argument("--verify-all", action="store_true",
                          help="Re-hash every existing file in scope, not just new ones")
     parser.add_argument("--dry-run", action="store_true", help="List actions without downloading")
+    parser.add_argument("--with-torrents", action="store_true",
+                        help="Run DEF CON torrents through initial checking, then continue torrent downloads "
+                            "alongside the HTTP crawl for the torrentless remainder.")
+    parser.add_argument("--torrent-max-active", type=int, default=8,
+                         help="If --with-torrents is set, maximum simultaneous torrents to fetch (default: 8)")
+    parser.add_argument("--torrent-connections", type=int, default=800,
+                         help="If --with-torrents is set, libtorrent connection cap (default: 800)")
+    parser.add_argument("--torrent-poll-seconds", type=int, default=10,
+                         help="If --with-torrents is set, progress refresh interval in seconds (default: 10)")
+    parser.add_argument("--torrent-seed-time", type=int, default=0,
+                         help="If --with-torrents is set, minutes to seed after completion (default: 0)")
     parser.add_argument("--manifest", default=None, help="Path to manifest JSON (default: <dest>/.infocon_manifest.json)")
     parser.add_argument("--log-file", default=None, help="Path to log file (default: <dest>/infocon_scraper.log)")
     parser.add_argument("--list-torrents", metavar="NAME",
@@ -901,7 +949,7 @@ def main() -> int:
     RUN.download_timeout = max(1, args.download_timeout)
     RUN.min_free_bytes = max(0, args.min_free_gib) * (1 << 30)
 
-    lock_path = os.path.join(args.dest, ".infocon_scraper.lock")
+    lock_path = shared_drive_lock_path(args.dest)
     if not acquire_lock(lock_path, force=args.force):
         log.error("Another sync appears to be running for %s (lock: %s). Use --force to override.",
                   args.dest, lock_path)
@@ -913,6 +961,36 @@ def main() -> int:
     defcon_media_skip = {f.strip() for f in args.defcon_media_skip.split(",") if f.strip()} \
         if args.defcon_media_skip else None
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
+
+    torrent_thread: threading.Thread | None = None
+    torrent_result = [0]
+    if args.with_torrents:
+        torrent_only = only_cons or None
+        torrent_ready = threading.Event()
+
+        def run_torrent_phase() -> None:
+            try:
+                torrent_result[0] = run_defcon_torrent_step(
+                    args.dest, torrent_only, args, ready_event=torrent_ready
+                )
+            except Exception:
+                log.exception("DEF CON torrent phase failed unexpectedly.")
+                torrent_result[0] = 1
+            finally:
+                torrent_ready.set()
+
+        torrent_thread = threading.Thread(
+            target=run_torrent_phase, name="defcon-torrents", daemon=False
+        )
+        torrent_thread.start()
+        log.info("Waiting for initial DEF CON torrent file checking before starting HTTP crawl ...")
+        torrent_ready.wait()
+        if torrent_result[0] != 0:
+            torrent_thread.join()
+            log.error("DEF CON torrent phase failed before HTTP could start; aborting HTTP crawl.")
+            release_lock(lock_path)
+            return 1
+        log.info("Initial DEF CON torrent checking finished; continuing torrent downloads alongside HTTP crawl.")
 
     log.info("Discovering content from sources: %s ...", ", ".join(sources))
     roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip,
@@ -942,6 +1020,8 @@ def main() -> int:
                            args.verify_all, args.dry_run, stop_requested, initial_files,
                            args.max_pending_downloads, stats)
     finally:
+        if torrent_thread:
+            torrent_thread.join()
         if reporter:
             reporter.stop()
             reporter.join(timeout=args.status_interval + 2)
@@ -956,7 +1036,7 @@ def main() -> int:
              human_bytes(final["downloaded_bytes"]), human_bytes(avg_rate),
              int(final["skipped"]), int(final["errors"]))
     log.info("Summary: %s", json.dumps(counts, indent=2))
-    return 1 if counts.get("error") else 0
+    return 1 if counts.get("error") or torrent_result[0] else 0
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -166,7 +167,8 @@ def discover_torrents(dir_url: str, settings: TorrentSettings) -> dict[str, str]
     return {base: href for base, (_, href) in best.items()}
 
 
-def fetch_all(dest: str, torrents_dir: str, only: list[str] | None, settings: TorrentSettings) -> int:
+def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
+              settings: TorrentSettings, ready_event: threading.Event | None = None) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
@@ -208,11 +210,15 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None, settings: To
 
     print("Verifying/downloading... (Ctrl+C to stop; already-correct files are skipped automatically)")
     try:
+        checking_complete = False
         while True:
             done = 0
             active = []
+            checking = False
             for name, h in handles.items():
                 s = h.status()
+                if s.state in (lt.torrent_status.checking_files, lt.torrent_status.checking_resume_data):
+                    checking = True
                 if s.progress >= 1.0 and s.state in (
                     lt.torrent_status.seeding,
                     lt.torrent_status.finished,
@@ -234,6 +240,10 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None, settings: To
             for rate, progress, peers, state, name in active[:12]:
                 print(f"{name}: {progress * 100:5.1f}%  down {rate / 1e6:6.2f} MB/s  "
                       f"peers {peers}  state {state}")
+            if ready_event is not None and not checking_complete and not checking:
+                checking_complete = True
+                print("Initial torrent file checking complete; HTTP sync may proceed in parallel.")
+                ready_event.set()
             if done == len(handles):
                 print("All requested DEF CON items fully downloaded and verified.")
                 break
@@ -241,6 +251,9 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None, settings: To
     except KeyboardInterrupt:
         print("Interrupted - already-verified pieces are safe; re-run to resume/continue.")
         return 1
+    finally:
+        if ready_event is not None and not ready_event.is_set():
+            ready_event.set()
     return 0
 
 
