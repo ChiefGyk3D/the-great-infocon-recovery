@@ -102,8 +102,15 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None) -> int:
         if not os.path.exists(torrent_path):
             print(f"Fetching torrent metadata for {name} ...")
             curl_download(torrent_url, torrent_path)
-        info = lt.torrent_info(torrent_path)
-        h = ses.add_torrent({"ti": info, "save_path": dest})
+        try:
+            info = lt.torrent_info(torrent_path)
+        except RuntimeError as exc:
+            print(f"Skipping {name}: could not load torrent ({exc})")
+            continue
+        atp = lt.add_torrent_params()
+        atp.ti = info
+        atp.save_path = dest
+        h = ses.add_torrent(atp)
         handles[name] = h
         print(f"Added {name}: {info.total_size() / 1e9:.2f} GB, {info.num_files()} files")
 

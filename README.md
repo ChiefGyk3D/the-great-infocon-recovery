@@ -106,6 +106,8 @@ Existing files are piece-hash checked. Correct pieces remain in place; missing o
 
 DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and any special folders not represented by torrents.
 
+> The `infocon_scraper.py --fetch-torrent` option shells out to `aria2c`, which only supports BitTorrent v1. DEF CON's per-archive torrents on `media.defcon.org` are v2, so use `fetch_defcon_torrents.py` (libtorrent) for those.
+
 ## Monitoring
 
 Run jobs detached if desired:
