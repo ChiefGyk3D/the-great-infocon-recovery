@@ -434,7 +434,8 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
              download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event,
              initial_files: list[RemoteFile] | None = None,
              max_pending_downloads: int | None = None,
-             stats: "ProgressStats | None" = None) -> dict[str, int]:
+             stats: "ProgressStats | None" = None,
+             skip_paths: list[str] | None = None) -> dict[str, int]:
     """Crawl and download at the same time: as soon as a file is discovered it's
     handed to the download pool immediately, instead of waiting for the entire
     site to be crawled first. This is what lets priority roots (DEF CON,
@@ -451,11 +452,19 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
     discovered += len(initial_files or [])
     pending_downloads = 0
     download_limit = max_pending_downloads or max(download_workers * 4, download_workers)
+    skip_filters = [f.lower() for f in (skip_paths or [])]
+
+    def skipped(rel_path: str) -> bool:
+        lowered = rel_path.lower()
+        return bool(skip_filters and any(f in lowered for f in skip_filters))
 
     with ThreadPoolExecutor(max_workers=crawl_workers) as crawl_pool, \
             ThreadPoolExecutor(max_workers=download_workers) as dl_pool:
         pending: dict = {}
         for url, rel in roots:
+            if skipped(rel):
+                log.info("Skipping configured path: %s", rel)
+                continue
             pending[crawl_pool.submit(list_directory, url)] = ("list", (url, rel))
         while pending:
             if stop_requested.is_set():
@@ -477,6 +486,9 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                     for entry in entries:
                         child_url = urljoin(url, entry["href"])
                         child_rel = os.path.join(rel, entry["name"]) if rel else entry["name"]
+                        if skipped(child_rel):
+                            log.info("Skipping configured path: %s", child_rel)
+                            continue
                         if entry["is_dir"]:
                             pending[crawl_pool.submit(list_directory, child_url)] = ("list", (child_url, child_rel))
                         else:
@@ -1031,7 +1043,7 @@ def main() -> int:
                 for key, value in run_sync(
                     non_defcon_roots, args.dest, manifest, args.crawl_workers, args.workers,
                     args.verify_all, args.dry_run, stop_requested, initial_files,
-                    args.max_pending_downloads, stats
+                    args.max_pending_downloads, stats, skip_paths=skip_recent
                 ).items():
                     counts[key] = counts.get(key, 0) + value
             log.info("Waiting for initial DEF CON torrent file checking before crawling DEF CON HTTP remainder ...")
@@ -1043,13 +1055,13 @@ def main() -> int:
                 for key, value in run_sync(
                     defcon_roots, args.dest, manifest, args.crawl_workers, args.workers,
                     args.verify_all, args.dry_run, stop_requested, [],
-                    args.max_pending_downloads, stats
+                    args.max_pending_downloads, stats, skip_paths=skip_recent
                 ).items():
                     counts[key] = counts.get(key, 0) + value
         else:
             counts = run_sync(roots, args.dest, manifest, args.crawl_workers, args.workers,
                               args.verify_all, args.dry_run, stop_requested, initial_files,
-                              args.max_pending_downloads, stats)
+                              args.max_pending_downloads, stats, skip_paths=skip_recent)
     finally:
         if torrent_thread:
             torrent_thread.join()
