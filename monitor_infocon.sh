@@ -27,8 +27,10 @@ while :; do
         fi
         space_available_bytes=$(df -P -B1 "$DEST" 2>/dev/null | awk 'NR == 2 {print $4}')
         inode_available_percent=$(df -P -i "$DEST" 2>/dev/null | awk 'NR == 2 {gsub("%", "", $5); print 100 - $5}')
-        df -P -h "$DEST" | awk 'NR == 2 {printf "Space: %s used / %s available (%s)\n", $3, $4, $5}'
-        df -P -i -h "$DEST" | awk 'NR == 2 {printf "Inodes: %s used / %s available (%s)\n", $3, $4, $5}'
+        printf '\n'
+        df -h "$DEST" 2>/dev/null
+        df -h -i "$DEST" 2>/dev/null
+        printf '\n'
         if [[ -n "$space_available_bytes" && "$space_available_bytes" -lt $((100 * 1024 * 1024 * 1024)) ]]; then
             printf 'ALERT: less than 100 GiB free on destination\n'
         fi
