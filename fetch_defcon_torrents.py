@@ -217,7 +217,11 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
             checking = False
             for name, h in handles.items():
                 s = h.status()
-                if s.state in (lt.torrent_status.checking_files, lt.torrent_status.checking_resume_data):
+                if s.state in (
+                    lt.torrent_status.queued_for_checking,
+                    lt.torrent_status.checking_files,
+                    lt.torrent_status.checking_resume_data,
+                ):
                     checking = True
                 if s.progress >= 1.0 and s.state in (
                     lt.torrent_status.seeding,
