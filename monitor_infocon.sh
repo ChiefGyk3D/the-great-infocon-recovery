@@ -27,51 +27,45 @@ while :; do
         fi
         space_available_bytes=$(df -P -B1 "$DEST" 2>/dev/null | awk 'NR == 2 {print $4}')
         inode_available_percent=$(df -P -i "$DEST" 2>/dev/null | awk 'NR == 2 {gsub("%", "", $5); print 100 - $5}')
-        df -P -h "$DEST" | awk 'NR == 2 {printf "Space: %s used / %s available (%s)\n", $3, $4, $5}'
-        df -P -i -h "$DEST" | awk 'NR == 2 {printf "Inodes: %s used / %s available (%s)\n", $3, $4, $5}'
         if [[ -n "$space_available_bytes" && "$space_available_bytes" -lt $((100 * 1024 * 1024 * 1024)) ]]; then
             printf 'ALERT: less than 100 GiB free on destination\n'
         fi
         if [[ -n "$inode_available_percent" ]] && awk "BEGIN {exit !($inode_available_percent < 5)}"; then
             printf 'ALERT: less than 5%% inodes available\n'
         fi
-        printf 'Cache: torrent metadata %s at %s\n' "$(size_for_path "$TORRENT_CACHE")" "$TORRENT_CACHE"
-        part_probe=$(timeout 2s find "$DEST" -type f -name '*.part' -print -quit 2>/dev/null || true)
-        if [[ -n "$part_probe" ]]; then
-            printf 'HTTP staging: .part files present (bounded probe; full scan disabled)\n'
-        else
-            printf 'HTTP staging: no .part file found by bounded probe\n'
-        fi
-        printf 'Load: %s\n' "$(uptime | sed 's/.*load average: //')"
+        printf 'Torrent cache (metadata only): %s  Load: %s\n' "$(size_for_path "$TORRENT_CACHE")" "$(uptime | sed 's/.*load average: //')"
         free -h | awk '/^Mem:/ {printf "Memory: %s used / %s available\n", $3, $7}'
+
+        printf '\nWorker:\n'
         if [[ -f "$DEST/.infocon_scraper.lock" ]]; then
             lock_pid=$(cat "$DEST/.infocon_scraper.lock")
-            printf 'Lock: PID %s\n' "$lock_pid"
-            ps -o pid,etime,stat,%cpu,%mem,nlwp,rss,cmd -p "$lock_pid" 2>/dev/null || printf 'Lock process is stale\n'
         else
-            printf 'Lock: absent\n'
+            lock_pid=""
         fi
-
-        printf '\nWorker resource use:\n'
         worker_pid_list=$(worker_pids)
-        if [[ -n "$worker_pid_list" ]]; then
+        if [[ -z "$worker_pid_list" ]]; then
+            printf '  none running (lock: %s)\n' "${lock_pid:-absent}"
+        else
             while read -r pid; do
                 [[ -z "$pid" ]] && continue
+                script_name=$(ps -o args= -p "$pid" 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i ~ /\.py$/) {print $i; exit}}')
                 fd_count=$(find "/proc/$pid/fd" -maxdepth 1 -type l 2>/dev/null | wc -l)
-                ps -o pid,etime,stat,%cpu,%mem,nlwp,rss,cmd --no-headers -p "$pid"
                 io_read=$(awk '/^read_bytes:/ {print $2}' "/proc/$pid/io" 2>/dev/null || echo 0)
                 io_write=$(awk '/^write_bytes:/ {print $2}' "/proc/$pid/io" 2>/dev/null || echo 0)
-                printf '  pid %s open-fds=%s lifetime-disk-read=%s lifetime-disk-write=%s\n' \
-                    "$pid" "$fd_count" "$(numfmt --to=iec "$io_read")" "$(numfmt --to=iec "$io_write")"
+                read -r etime stat cpu mem nlwp rss <<< "$(ps -o etime=,stat=,%cpu=,%mem=,nlwp=,rss= -p "$pid" 2>/dev/null)"
+                printf '  %s (pid %s%s)  up %s  cpu %s%%  mem %s%%  threads %s  rss %s  fds %s  disk r/w %s/%s\n' \
+                    "${script_name:-python}" "$pid" \
+                    "$([[ "$pid" == "$lock_pid" ]] && printf ' lock-owner' || printf '')" \
+                    "$etime" "$cpu" "$mem" "$nlwp" "$(numfmt --to=iec "$((rss * 1024))")" "$fd_count" \
+                    "$(numfmt --to=iec "$io_read")" "$(numfmt --to=iec "$io_write")"
             done <<< "$worker_pid_list"
-        else
-            printf 'none\n'
         fi
 
         printf '\nRecent errors:\n'
-        grep -Ei 'error|failed|diskfull|insufficient|exception|not mounted' run.out 2>/dev/null | tail -n 5 || printf 'none\n'
+        grep -Ei 'error|failed|diskfull|insufficient|exception|not mounted' run.out 2>/dev/null | tail -n 2 | cut -c1-120 || printf '  none\n'
     } > "${OUTPUT}.tmp.$$"
     mv -f "${OUTPUT}.tmp.$$" "$OUTPUT"
 
     sleep "$INTERVAL"
 done
+

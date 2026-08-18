@@ -14,12 +14,13 @@ while :; do
         printf 'HTTP progress has not emitted a status line yet.\n'
     fi
 
-    printf '\nLatest counters:\n'
-    grep -E 'Progress: [0-9]+ files completed|STATUS|Done in' "$LOG" 2>/dev/null | tail -n 6 || true
-
-    printf '\nActive HTTP staging:\n'
-    part_count=$(timeout 2s find "${INFOCON_DEST:-/media/chiefgyk3d/infocon.org DC30}" -type f -name '*.part' -print 2>/dev/null | wc -l)
-    printf '.part files observed in bounded scan: %s\n' "$part_count"
+    printf '\nHTTP staging:\n'
+    part_probe=$(timeout 2s find "${INFOCON_DEST:-/media/chiefgyk3d/infocon.org DC30}" -type f -name '*.part' -print -quit 2>/dev/null || true)
+    if [[ -n "$part_probe" ]]; then
+        printf 'at least one .part file in progress (bounded probe; full scan disabled)\n'
+    else
+        printf 'no .part file found by bounded probe\n'
+    fi
 
     printf '\nRecent HTTP failures:\n'
     grep -Ei 'ERROR|curl: \(' "$LOG" 2>/dev/null | tail -n 6 || printf 'none\n'
