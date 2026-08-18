@@ -5,6 +5,7 @@ DEST="${INFOCON_DEST:-/media/chiefgyk3d/infocon.org DC30}"
 INTERVAL=${INFOCON_MONITOR_INTERVAL:-10}
 INTERFACE=${INFOCON_NETWORK_INTERFACE:-eno1}
 OUTPUT=${INFOCON_MONITOR_OUTPUT:-infocon-monitor.out}
+TORRENT_CACHE=${INFOCON_TORRENT_CACHE:-$HOME/.cache/infocon-scraper/torrents}
 
 read_net_bytes() {
     awk -v iface="$INTERFACE" '$1 ~ "^" iface ":$" {print $2, $10; found=1} END {if (!found) print 0, 0}' /proc/net/dev
@@ -19,6 +20,14 @@ fi
 
 read_disk_sectors() {
     awk -v disk="$disk_name" '$3 == disk {print $6, $10; found=1} END {if (!found) print 0, 0}' /proc/diskstats
+}
+
+worker_pids() {
+    ps -eo pid=,args= | awk '$2 ~ /python/ && $0 ~ /(^|[[:space:]\/])(infocon_scraper|fetch_defcon_torrents)\.py([[:space:]]|$)/ {print $1}'
+}
+
+size_for_path() {
+    du -sh "$1" 2>/dev/null | awk '{print $1}'
 }
 
 read -r previous_rx previous_tx <<< "$(read_net_bytes)"
@@ -61,6 +70,13 @@ while :; do
             "$(numfmt --to=iec "$rx_rate")" "$(numfmt --to=iec "$tx_rate")" \
             "$(numfmt --to=iec "$((rx_rate + tx_rate))")"
         printf 'Disk %s: read %s/s  write %s/s\n' "$disk_name" "$(numfmt --to=iec "$read_rate")" "$(numfmt --to=iec "$write_rate")"
+        printf 'Cache: torrent metadata %s at %s\n' "$(size_for_path "$TORRENT_CACHE")" "$TORRENT_CACHE"
+        part_probe=$(timeout 2s find "$DEST" -type f -name '*.part' -print -quit 2>/dev/null || true)
+        if [[ -n "$part_probe" ]]; then
+            printf 'HTTP staging: .part files present (bounded probe; full scan disabled)\n'
+        else
+            printf 'HTTP staging: no .part file found by bounded probe\n'
+        fi
         printf 'Load: %s\n' "$(uptime | sed 's/.*load average: //')"
         free -h | awk '/^Mem:/ {printf "Memory: %s used / %s available\n", $3, $7}'
         printf 'Connections: '
@@ -75,14 +91,17 @@ while :; do
         fi
 
         printf '\nWorker resource use:\n'
-        worker_pids=$(pgrep -f '[.]venv/bin/python.*(infocon_scraper|fetch_defcon_torrents)\.py' || true)
-        if [[ -n "$worker_pids" ]]; then
+        worker_pid_list=$(worker_pids)
+        if [[ -n "$worker_pid_list" ]]; then
             while read -r pid; do
                 [[ -z "$pid" ]] && continue
                 fd_count=$(find "/proc/$pid/fd" -maxdepth 1 -type l 2>/dev/null | wc -l)
                 ps -o pid,etime,stat,%cpu,%mem,nlwp,rss,cmd --no-headers -p "$pid"
-                printf '  pid %s open-fds=%s\n' "$pid" "$fd_count"
-            done <<< "$worker_pids"
+                io_read=$(awk '/^read_bytes:/ {print $2}' "/proc/$pid/io" 2>/dev/null || echo 0)
+                io_write=$(awk '/^write_bytes:/ {print $2}' "/proc/$pid/io" 2>/dev/null || echo 0)
+                printf '  pid %s open-fds=%s lifetime-disk-read=%s lifetime-disk-write=%s\n' \
+                    "$pid" "$fd_count" "$(numfmt --to=iec "$io_read")" "$(numfmt --to=iec "$io_write")"
+            done <<< "$worker_pid_list"
         else
             printf 'none\n'
         fi
