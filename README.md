@@ -76,6 +76,18 @@ python infocon_scraper.py --dest "/path/to/drive" --dry-run
 
 The HTTP scraper uses separate directory-listing and download worker pools. It streams work as directories are discovered, so later large trees do not block priority content. Requests to `media.defcon.org` are capped to avoid server throttling.
 
+Tune HTTP concurrency for a particular machine or network:
+
+```bash
+# More directory listings, fewer downloads
+python infocon_scraper.py --dest "/path/to/drive" \
+  --crawl-workers 24 --workers 4
+
+# Fewer connections for a throttled host or slower disk
+python infocon_scraper.py --dest "/path/to/drive" \
+  --crawl-workers 4 --workers 2
+```
+
 ## DEF CON Torrents
 
 The per-archive torrents are BitTorrent v2 metadata. Older distro versions of `aria2c` and `transmission-cli` may reject them, so the helper uses Python `libtorrent`.
@@ -103,6 +115,32 @@ INFOCON_TORRENTS_CACHE="/fast/nvme/infocon-torrents" \
 ```
 
 Existing files are piece-hash checked. Correct pieces remain in place; missing or altered pieces are downloaded. Stop with `Ctrl+C` and rerun to resume.
+
+The torrent runner is deliberately adjustable:
+
+```bash
+# Eight active torrents, 800 total peer connections
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --max-active 8 --connections 800
+
+# One active torrent for a constrained connection or disk
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --max-active 1 --connections 100 --poll-seconds 30
+
+# Unlimited active torrents, if the machine and network can handle it
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --max-active 0
+
+# Tune peer discovery and metadata retry behavior
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --no-lsd --request-timeout 300 --retries 5 --retry-delay 10
+
+# Bind BitTorrent to a chosen interface and port
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --listen-interface "0.0.0.0:51413"
+```
+
+The default torrent status output reports the total rate, number of active torrents, and queued/idle torrents. A torrent showing zero peers can be queued by libtorrent or temporarily have no available peers; it is not automatically an error.
 
 DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and any special folders not represented by torrents.
 

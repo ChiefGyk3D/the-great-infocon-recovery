@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 import libtorrent as lt
 
@@ -42,10 +43,26 @@ DEFAULT_TORRENTS_CACHE = os.environ.get(
 )
 
 
-def curl_text(url: str) -> str:
+@dataclass(frozen=True)
+class TorrentSettings:
+    max_active: int
+    connections: int
+    listen_interface: str
+    poll_seconds: int
+    seed_time: int
+    enable_dht: bool
+    enable_pex: bool
+    enable_lsd: bool
+    request_timeout: int
+    retries: int
+    retry_delay: int
+
+
+def curl_text(url: str, settings: TorrentSettings) -> str:
     proc = subprocess.run(
-        ["curl", "-sS", "-A", USER_AGENT, "--retry", "3", "--retry-delay", "3",
-         "--retry-all-errors", "-L", "--fail", url],
+        ["curl", "-sS", "-A", USER_AGENT, "--retry", str(settings.retries),
+         "--retry-delay", str(settings.retry_delay), "--retry-all-errors",
+         "--max-time", str(settings.request_timeout), "-L", "--fail", url],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -53,19 +70,21 @@ def curl_text(url: str) -> str:
     return proc.stdout
 
 
-def curl_download(url: str, local_path: str) -> None:
+def curl_download(url: str, local_path: str, settings: TorrentSettings) -> None:
     proc = subprocess.run(
-        ["curl", "-sS", "-A", USER_AGENT, "--retry", "3", "--retry-delay", "3",
-         "--retry-all-errors", "-L", "--fail", "-o", local_path, url],
+        ["curl", "-sS", "-A", USER_AGENT, "--retry", str(settings.retries),
+         "--retry-delay", str(settings.retry_delay), "--retry-all-errors",
+         "--max-time", str(settings.request_timeout), "-L", "--fail",
+         "-o", local_path, url],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"curl failed ({proc.returncode}) for {url}: {proc.stderr.strip()}")
 
 
-def discover_torrents(dir_url: str) -> dict[str, str]:
+def discover_torrents(dir_url: str, settings: TorrentSettings) -> dict[str, str]:
     """Return {base_name: href} picking the highest 'vN' version per base name."""
-    html = curl_text(dir_url)
+    html = curl_text(dir_url, settings)
     hrefs = re.findall(r'href="([^"]+\.torrent)"', html)
     best: dict[str, tuple[int, str]] = {}
     for href in hrefs:
@@ -79,11 +98,11 @@ def discover_torrents(dir_url: str) -> dict[str, str]:
     return {base: href for base, (_, href) in best.items()}
 
 
-def fetch_all(dest: str, torrents_dir: str, only: list[str] | None) -> int:
+def fetch_all(dest: str, torrents_dir: str, only: list[str] | None, settings: TorrentSettings) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
-    available = discover_torrents(TORRENTS_DIR_URL)
+    available = discover_torrents(TORRENTS_DIR_URL, settings)
     if only:
         filters = [f.lower() for f in only]
         available = {name: href for name, href in available.items()
@@ -93,15 +112,30 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None) -> int:
         return 1
 
     print(f"Found {len(available)} torrents to fetch/verify.")
-    ses = lt.session({"listen_interfaces": "0.0.0.0:6881"})
+    # libtorrent auto-manages torrents and by default only actively downloads a
+    # few at once (active_downloads=3); the rest sit queued with 0 peers. Raise
+    # the limits so the whole set downloads in parallel. max_active <= 0 means
+    # unlimited (-1 in libtorrent).
+    limit = settings.max_active if settings.max_active > 0 else -1
+    ses = lt.session({
+        "listen_interfaces": settings.listen_interface,
+        "active_downloads": limit,
+        "active_seeds": limit,
+        "active_limit": limit,
+        "connections_limit": settings.connections,
+        "enable_dht": settings.enable_dht,
+        "enable_pex": settings.enable_pex,
+        "enable_lsd": settings.enable_lsd,
+    })
     handles = {}
+    completed_at: dict[str, float] = {}
 
     for name, href in sorted(available.items()):
         torrent_url = TORRENTS_DIR_URL + href
         torrent_path = os.path.join(torrents_dir, f"{name}.torrent")
         if not os.path.exists(torrent_path):
             print(f"Fetching torrent metadata for {name} ...")
-            curl_download(torrent_url, torrent_path)
+            curl_download(torrent_url, torrent_path, settings)
         try:
             info = lt.torrent_info(torrent_path)
         except RuntimeError as exc:
@@ -118,23 +152,34 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None) -> int:
     try:
         while True:
             done = 0
-            active_lines = []
+            active = []
             for name, h in handles.items():
                 s = h.status()
-                if s.state in (lt.torrent_status.seeding, lt.torrent_status.finished):
+                if s.progress >= 1.0 and s.state in (
+                    lt.torrent_status.seeding,
+                    lt.torrent_status.finished,
+                    lt.torrent_status.paused,
+                ):
                     done += 1
+                    completed_at.setdefault(name, time.time())
+                    if settings.seed_time == 0 and s.state != lt.torrent_status.paused:
+                        h.pause()
+                    elif settings.seed_time > 0 and time.time() - completed_at[name] >= settings.seed_time * 60:
+                        h.pause()
                 else:
-                    active_lines.append(
-                        f"{name}: {s.progress * 100:5.1f}%  down {s.download_rate / 1e6:6.2f} MB/s  "
-                        f"peers {s.num_peers}  state {s.state}"
-                    )
-            print(f"--- {done}/{len(handles)} complete ---")
-            for line in active_lines[:10]:
-                print(line)
+                    active.append((s.download_rate, s.progress, s.num_peers, str(s.state), name))
+            active.sort(reverse=True)  # highest download rate first
+            total_rate = sum(a[0] for a in active)
+            downloading = sum(1 for a in active if a[0] > 0)
+            print(f"--- {done}/{len(handles)} complete | {total_rate / 1e6:6.2f} MB/s total | "
+                  f"{downloading} active, {len(active) - downloading} queued/idle ---")
+            for rate, progress, peers, state, name in active[:12]:
+                print(f"{name}: {progress * 100:5.1f}%  down {rate / 1e6:6.2f} MB/s  "
+                      f"peers {peers}  state {state}")
             if done == len(handles):
                 print("All requested DEF CON items fully downloaded and verified.")
                 break
-            time.sleep(10)
+            time.sleep(settings.poll_seconds)
     except KeyboardInterrupt:
         print("Interrupted - already-verified pieces are safe; re-run to resume/continue.")
         return 1
@@ -149,10 +194,42 @@ def main() -> int:
                               "(default: all available torrents)")
     parser.add_argument("--torrents-dir", default=DEFAULT_TORRENTS_CACHE,
                          help=f"Where to cache .torrent files (default: {DEFAULT_TORRENTS_CACHE})")
+    parser.add_argument("--max-active", type=int, default=8,
+                         help="Maximum simultaneous active torrents; 0 means unlimited (default: 8)")
+    parser.add_argument("--connections", type=int, default=800,
+                         help="Global libtorrent connection limit (default: 800)")
+    parser.add_argument("--listen-interface", default="0.0.0.0:6881",
+                         help="Listening address and port, e.g. 0.0.0.0:6881 or 192.0.2.10:51413")
+    parser.add_argument("--poll-seconds", type=int, default=10,
+                         help="Progress reporting interval (default: 10)")
+    parser.add_argument("--seed-time", type=int, default=0,
+                         help="Minutes to seed after completion; 0 disables seeding")
+    parser.add_argument("--no-dht", action="store_true", help="Disable the distributed hash table")
+    parser.add_argument("--no-pex", action="store_true", help="Disable peer exchange")
+    parser.add_argument("--no-lsd", action="store_true", help="Disable local peer discovery")
+    parser.add_argument("--request-timeout", type=int, default=120,
+                         help="curl metadata request timeout in seconds (default: 120)")
+    parser.add_argument("--retries", type=int, default=3,
+                         help="curl retry count for metadata (default: 3)")
+    parser.add_argument("--retry-delay", type=int, default=3,
+                         help="Seconds between metadata retries (default: 3)")
     args = parser.parse_args()
 
     only = [f.strip() for f in args.only.split(",") if f.strip()] if args.only else None
-    return fetch_all(args.dest, args.torrents_dir, only)
+    settings = TorrentSettings(
+        max_active=args.max_active,
+        connections=args.connections,
+        listen_interface=args.listen_interface,
+        poll_seconds=max(1, args.poll_seconds),
+        seed_time=max(0, args.seed_time),
+        enable_dht=not args.no_dht,
+        enable_pex=not args.no_pex,
+        enable_lsd=not args.no_lsd,
+        request_timeout=max(1, args.request_timeout),
+        retries=max(0, args.retries),
+        retry_delay=max(0, args.retry_delay),
+    )
+    return fetch_all(args.dest, args.torrents_dir, only, settings)
 
 
 if __name__ == "__main__":
