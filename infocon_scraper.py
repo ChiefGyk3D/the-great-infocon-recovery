@@ -894,8 +894,8 @@ def main() -> int:
                          help="Re-hash every existing file in scope, not just new ones")
     parser.add_argument("--dry-run", action="store_true", help="List actions without downloading")
     parser.add_argument("--with-torrents", action="store_true",
-                        help="Run DEF CON torrents through initial checking, then continue torrent downloads "
-                            "alongside the HTTP crawl for the torrentless remainder.")
+                        help="Crawl non-DEF CON content during torrent checking, then crawl the torrentless "
+                            "DEF CON remainder while torrents continue downloading.")
     parser.add_argument("--torrent-max-active", type=int, default=8,
                          help="If --with-torrents is set, maximum simultaneous torrents to fetch (default: 8)")
     parser.add_argument("--torrent-connections", type=int, default=800,
@@ -962,40 +962,17 @@ def main() -> int:
         if args.defcon_media_skip else None
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
 
-    torrent_thread: threading.Thread | None = None
-    torrent_result = [0]
-    if args.with_torrents:
-        torrent_only = only_cons or None
-        torrent_ready = threading.Event()
-
-        def run_torrent_phase() -> None:
-            try:
-                torrent_result[0] = run_defcon_torrent_step(
-                    args.dest, torrent_only, args, ready_event=torrent_ready
-                )
-            except Exception:
-                log.exception("DEF CON torrent phase failed unexpectedly.")
-                torrent_result[0] = 1
-            finally:
-                torrent_ready.set()
-
-        torrent_thread = threading.Thread(
-            target=run_torrent_phase, name="defcon-torrents", daemon=False
-        )
-        torrent_thread.start()
-        log.info("Waiting for initial DEF CON torrent file checking before starting HTTP crawl ...")
-        torrent_ready.wait()
-        if torrent_result[0] != 0:
-            torrent_thread.join()
-            log.error("DEF CON torrent phase failed before HTTP could start; aborting HTTP crawl.")
-            release_lock(lock_path)
-            return 1
-        log.info("Initial DEF CON torrent checking finished; continuing torrent downloads alongside HTTP crawl.")
-
     log.info("Discovering content from sources: %s ...", ", ".join(sources))
     roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip,
                         only_cons, only_top, only_mirrors, skip_torrented=not args.no_skip_torrented)
     log.info("Target sections (priority order): %s", ", ".join(rel for _, rel in roots))
+    def is_defcon_root(root: tuple[str, str]) -> bool:
+        return root[1].lower().startswith("cons/def con")
+
+    defcon_roots = [root for root in roots if is_defcon_root(root)]
+    non_defcon_roots = [root for root in roots if not is_defcon_root(root)]
+    torrent_thread: threading.Thread | None = None
+    torrent_result = [0]
     manifest = Manifest(manifest_path)
 
     stop_requested = threading.Event()
@@ -1016,9 +993,50 @@ def main() -> int:
         reporter.start()
 
     try:
-        counts = run_sync(roots, args.dest, manifest, args.crawl_workers, args.workers,
-                           args.verify_all, args.dry_run, stop_requested, initial_files,
-                           args.max_pending_downloads, stats)
+        counts: dict[str, int] = {}
+        if args.with_torrents:
+            torrent_only = only_cons or None
+            torrent_ready = threading.Event()
+
+            def run_torrent_phase() -> None:
+                try:
+                    torrent_result[0] = run_defcon_torrent_step(
+                        args.dest, torrent_only, args, ready_event=torrent_ready
+                    )
+                except Exception:
+                    log.exception("DEF CON torrent phase failed unexpectedly.")
+                    torrent_result[0] = 1
+                finally:
+                    torrent_ready.set()
+
+            torrent_thread = threading.Thread(
+                target=run_torrent_phase, name="defcon-torrents", daemon=False
+            )
+            torrent_thread.start()
+            if non_defcon_roots:
+                log.info("Crawling non-DEF CON content while torrent files are checked ...")
+                for key, value in run_sync(
+                    non_defcon_roots, args.dest, manifest, args.crawl_workers, args.workers,
+                    args.verify_all, args.dry_run, stop_requested, initial_files,
+                    args.max_pending_downloads, stats
+                ).items():
+                    counts[key] = counts.get(key, 0) + value
+            log.info("Waiting for initial DEF CON torrent file checking before crawling DEF CON HTTP remainder ...")
+            torrent_ready.wait()
+            if torrent_result[0] != 0:
+                log.error("DEF CON torrent phase failed before its HTTP remainder could start.")
+            elif defcon_roots:
+                log.info("Initial DEF CON torrent checking finished; crawling torrentless DEF CON HTTP remainder ...")
+                for key, value in run_sync(
+                    defcon_roots, args.dest, manifest, args.crawl_workers, args.workers,
+                    args.verify_all, args.dry_run, stop_requested, [],
+                    args.max_pending_downloads, stats
+                ).items():
+                    counts[key] = counts.get(key, 0) + value
+        else:
+            counts = run_sync(roots, args.dest, manifest, args.crawl_workers, args.workers,
+                              args.verify_all, args.dry_run, stop_requested, initial_files,
+                              args.max_pending_downloads, stats)
     finally:
         if torrent_thread:
             torrent_thread.join()
