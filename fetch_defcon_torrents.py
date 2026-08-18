@@ -43,6 +43,47 @@ DEFAULT_TORRENTS_CACHE = os.environ.get(
 )
 
 
+def shared_drive_lock_path(dest: str) -> str:
+    """Map the torrent dest and the HTTP dest to the same drive-level lock file."""
+    path = os.path.abspath(dest)
+    if os.path.basename(path) == "DEF CON" and os.path.basename(os.path.dirname(path)) == "cons":
+        path = os.path.dirname(os.path.dirname(path))
+    return os.path.join(path, ".infocon_scraper.lock")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def acquire_lock(lock_path: str, force: bool = False) -> bool:
+    """Create an exclusive PID lock on the drive root. Returns False if another active sync holds it."""
+    if os.path.exists(lock_path):
+        try:
+            with open(lock_path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            pid = int(text) if text else 0
+        except (ValueError, OSError):
+            pid = 0
+        if pid and _pid_alive(pid) and not force:
+            return False
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+    try:
+        with open(lock_path, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        return True
+    except OSError:
+        return False
+
+
 @dataclass(frozen=True)
 class TorrentSettings:
     max_active: int
@@ -56,6 +97,33 @@ class TorrentSettings:
     request_timeout: int
     retries: int
     retry_delay: int
+
+
+def build_libtorrent_session(settings: TorrentSettings) -> lt.session:
+    """Create a libtorrent session using the settings keys supported by libtorrent 2.1.x.
+
+    This runtime does not expose an `enable_pex` session setting, so peer exchange
+    remains under libtorrent's default behavior rather than being forced via a
+    non-existent setting key.
+    """
+    limit = settings.max_active if settings.max_active > 0 else -1
+    session_settings = lt.default_settings()
+    session_settings["listen_interfaces"] = settings.listen_interface
+    session_settings["active_downloads"] = limit
+    session_settings["active_seeds"] = limit
+    session_settings["active_limit"] = limit
+    session_settings["connections_limit"] = settings.connections
+
+    if "enable_dht" in session_settings:
+        session_settings["enable_dht"] = bool(settings.enable_dht)
+    if "enable_lsd" in session_settings:
+        session_settings["enable_lsd"] = bool(settings.enable_lsd)
+    if "enable_pex" in session_settings:
+        session_settings["enable_pex"] = bool(settings.enable_pex)
+
+    params = lt.session_params()
+    params.settings = session_settings
+    return lt.session(params)
 
 
 def curl_text(url: str, settings: TorrentSettings) -> str:
@@ -116,17 +184,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None, settings: To
     # few at once (active_downloads=3); the rest sit queued with 0 peers. Raise
     # the limits so the whole set downloads in parallel. max_active <= 0 means
     # unlimited (-1 in libtorrent).
-    limit = settings.max_active if settings.max_active > 0 else -1
-    ses = lt.session({
-        "listen_interfaces": settings.listen_interface,
-        "active_downloads": limit,
-        "active_seeds": limit,
-        "active_limit": limit,
-        "connections_limit": settings.connections,
-        "enable_dht": settings.enable_dht,
-        "enable_pex": settings.enable_pex,
-        "enable_lsd": settings.enable_lsd,
-    })
+    ses = build_libtorrent_session(settings)
     handles = {}
     completed_at: dict[str, float] = {}
 
@@ -189,6 +247,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None, settings: To
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch/verify DEF CON archives via BitTorrent v2 (libtorrent).")
     parser.add_argument("--dest", required=True, help="Destination cons/DEF CON directory")
+    parser.add_argument("--force", action="store_true",
+                         help="Override the shared drive-level lock and run anyway")
     parser.add_argument("--only", default=None,
                          help="Comma-separated substrings to restrict which items are fetched "
                               "(default: all available torrents)")
@@ -214,6 +274,11 @@ def main() -> int:
     parser.add_argument("--retry-delay", type=int, default=3,
                          help="Seconds between metadata retries (default: 3)")
     args = parser.parse_args()
+
+    lock_path = shared_drive_lock_path(args.dest)
+    if not acquire_lock(lock_path, force=args.force):
+        print(f"Another sync appears to be running for the same drive root (lock: {lock_path}). Use --force to override.")
+        return 2
 
     only = [f.strip() for f in args.only.split(",") if f.strip()] if args.only else None
     settings = TorrentSettings(
