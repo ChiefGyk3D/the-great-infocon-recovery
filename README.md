@@ -253,6 +253,23 @@ pgrep -fa 'infocon_scraper.py|fetch_defcon_torrents.py'
 df -h "/path/to/drive"
 ```
 
+For a detached dashboard with scraper status, lock ownership, network throughput, disk I/O, free space, and recent log output:
+
+```bash
+nohup ./monitor_infocon.sh > monitor-daemon.log 2>&1 &
+tail -f infocon-monitor.out
+```
+
+The monitor defaults to `/media/chiefgyk3d/infocon.org DC30` and `eno1`. Override them with `INFOCON_DEST`, `INFOCON_NETWORK_INTERFACE`, `INFOCON_MONITOR_INTERVAL`, or `INFOCON_MONITOR_OUTPUT`. Stop the dashboard with `pkill -f monitor_infocon.sh`; stopping it does not stop the scraper.
+
+For a persistent detachable four-pane dashboard, use the local tmux bundle:
+
+```bash
+./tmux-infocon.sh attach -t infocon-monitor
+```
+
+The panes show the scraper log, the status/network dashboard, `iostat` disk throughput, and `vmstat` system activity. Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with the same command, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
+
 The HTTP manifest is stored at `<destination>/.infocon_manifest.json` by default. Logs can be placed elsewhere with `--log-file`.
 
 ## Robustness

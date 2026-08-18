@@ -1,4 +1,6 @@
 .venv/
+.monitor-tools/
+.monitor-pkgs/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -7,6 +9,7 @@ __pycache__/
 .torrents-cache/
 run.out
 torrent.out
+infocon-monitor.out
 *.log
 *.torrent
 .infocon_manifest.json
