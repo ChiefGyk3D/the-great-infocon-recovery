@@ -103,6 +103,65 @@ class CurlError(RuntimeError):
     pass
 
 
+@dataclass
+class RunConfig:
+    retries: int = 4
+    download_timeout: int = 3600
+    min_free_bytes: int = 1 << 30  # keep at least 1 GiB free
+    manifest_save_every: int = 200
+
+
+# Populated once in main() before any worker starts; read-only during a run.
+RUN = RunConfig()
+
+
+def has_free_space(directory: str, needed: int) -> bool:
+    """True if directory's filesystem can hold `needed` bytes plus the safety margin."""
+    try:
+        free = shutil.disk_usage(directory).free
+    except OSError:
+        return True  # can't tell; don't block on it
+    return free >= needed + RUN.min_free_bytes
+
+
+def acquire_lock(lock_path: str, force: bool = False) -> bool:
+    """Create an exclusive PID lock file. Returns False if a live instance holds it.
+    A stale lock (owning PID no longer running) is reclaimed automatically."""
+    if os.path.exists(lock_path):
+        try:
+            existing_pid = int(open(lock_path, encoding="utf-8").read().strip() or "0")
+        except (OSError, ValueError):
+            existing_pid = 0
+        if existing_pid and _pid_alive(existing_pid) and not force:
+            return False
+        _safe_remove(lock_path)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def release_lock(lock_path: str) -> None:
+    try:
+        if os.path.exists(lock_path) and open(lock_path, encoding="utf-8").read().strip() == str(os.getpid()):
+            _safe_remove(lock_path)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 # media.defcon.org appears to throttle/drop connections once too many are
 # open at once (crawl + download workers combined easily exceed a dozen).
 # Cap concurrent requests per host to avoid connection-timeout errors that
@@ -166,6 +225,43 @@ def curl_download(url: str, local_path: str, resume: bool, timeout: int = 3600) 
     proc = run_curl(args, timeout, url=url)
     if proc.returncode != 0:
         raise CurlError(f"curl download failed ({proc.returncode}) for {url}: {proc.stderr.decode(errors='replace').strip()}")
+
+
+def download_atomic(url: str, local_path: str, remote_size: int | None) -> None:
+    """Download to a .part sibling and rename into place only after the size is
+    verified, so an interrupted or truncated transfer never leaves a file that
+    looks complete. Resumes an existing .part when the server supports it, and
+    retries with backoff on failure or size mismatch."""
+    part = local_path + ".part"
+    last_err: str | None = None
+    for attempt in range(1, RUN.retries + 1):
+        resume = bool(remote_size and os.path.exists(part) and 0 < os.path.getsize(part) < remote_size)
+        try:
+            curl_download(url, part, resume=resume, timeout=RUN.download_timeout)
+        except CurlError as exc:
+            last_err = str(exc)
+            # An overshoot means the .part is unusable for resume; start clean next time.
+            if os.path.exists(part) and remote_size and os.path.getsize(part) > remote_size:
+                _safe_remove(part)
+            time.sleep(min(30, 3 * attempt))
+            continue
+        got = os.path.getsize(part) if os.path.exists(part) else 0
+        if remote_size is not None and got != remote_size:
+            last_err = f"size mismatch (got {got}, expected {remote_size})"
+            if got > remote_size:
+                _safe_remove(part)
+            time.sleep(min(30, 3 * attempt))
+            continue
+        os.replace(part, local_path)
+        return
+    raise CurlError(f"download failed after {RUN.retries} attempts for {url}: {last_err}")
+
+
+def _safe_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def list_directory(url: str) -> list[dict]:
@@ -251,8 +347,13 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                         result = "error"
                     counts[result] = counts.get(result, 0) + 1
                     completed += 1
+                    if result == "error-diskfull":
+                        log.error("Halting: destination filesystem is full.")
+                        stop_requested.set()
                     if completed % 25 == 0:
                         log.info("Progress: %d files completed (%d discovered so far)", completed, discovered)
+                    if completed % RUN.manifest_save_every == 0 and not dry_run:
+                        manifest.save()
 
             while ready_files and pending_downloads < download_limit:
                 item = ready_files.popleft()
@@ -351,15 +452,25 @@ def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
                                 "verified": time.time()})
             return "baseline-recorded"
 
+    part_path = local_path + ".part"
+    part_size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+
     if dry_run:
-        action = "would-resume" if exists and remote_size and local_size < remote_size else "would-download"
+        resuming = remote_size and (0 < local_size < remote_size or 0 < part_size < remote_size)
+        action = "would-resume" if resuming else "would-download"
         log.info("[dry-run] %s -> %s", action, rel)
         return action
 
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
-    resume = bool(exists and remote_size and local_size < remote_size)
+
+    # Only the bytes still needed matter for the space check (resuming a .part).
+    needed = (remote_size - part_size) if (remote_size and part_size < remote_size) else (remote_size or 0)
+    if remote_size and not has_free_space(os.path.dirname(local_path) or ".", needed):
+        log.error("Insufficient free space for %s (needs ~%d bytes)", rel, needed)
+        return "error-diskfull"
+
     try:
-        curl_download(item.url, local_path, resume=resume)
+        download_atomic(item.url, local_path, remote_size)
     except CurlError as exc:
         log.error("Download failed for %s: %s", item.url, exc)
         return "error"
@@ -550,6 +661,14 @@ def main() -> int:
     parser.add_argument("--max-pending-downloads", type=int, default=None,
                          help="Maximum queued/in-flight file downloads (default: workers * 4)")
     parser.add_argument("--crawl-workers", type=int, default=16, help="Concurrent directory-listing workers")
+    parser.add_argument("--retries", type=int, default=4,
+                         help="Per-file download attempts before giving up (default: 4)")
+    parser.add_argument("--download-timeout", type=int, default=3600,
+                         help="Max seconds for a single file download attempt (default: 3600)")
+    parser.add_argument("--min-free-gib", type=int, default=1,
+                         help="Refuse a download that would leave less than this many GiB free (default: 1)")
+    parser.add_argument("--force", action="store_true",
+                         help="Override the single-instance lock and run anyway")
     parser.add_argument("--verify-all", action="store_true",
                          help="Re-hash every existing file in scope, not just new ones")
     parser.add_argument("--dry-run", action="store_true", help="List actions without downloading")
@@ -594,6 +713,16 @@ def main() -> int:
         print(f"Warning: could not open log file {log_file}: {exc}", file=sys.stderr)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
 
+    RUN.retries = max(1, args.retries)
+    RUN.download_timeout = max(1, args.download_timeout)
+    RUN.min_free_bytes = max(0, args.min_free_gib) * (1 << 30)
+
+    lock_path = os.path.join(args.dest, ".infocon_scraper.lock")
+    if not acquire_lock(lock_path, force=args.force):
+        log.error("Another sync appears to be running for %s (lock: %s). Use --force to override.",
+                  args.dest, lock_path)
+        return 2
+
     only_cons = [f.strip() for f in args.only_cons.split(",") if f.strip()] if args.only_cons else None
     only_top = [f.strip() for f in args.only_top.split(",") if f.strip()] if args.only_top else None
     only_mirrors = [f.strip() for f in args.only_mirrors.split(",") if f.strip()] if args.only_mirrors else None
@@ -609,11 +738,12 @@ def main() -> int:
 
     stop_requested = threading.Event()
 
-    def handle_sigint(signum, frame):
-        log.warning("Interrupt received, finishing in-flight downloads and saving manifest...")
+    def handle_stop(signum, frame):
+        log.warning("Signal %s received, finishing in-flight downloads and saving manifest...", signum)
         stop_requested.set()
 
-    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGINT, handle_stop)
+    signal.signal(signal.SIGTERM, handle_stop)
 
     initial_files = discover_mirror_files(args.base_url, only_mirrors) \
         if "infocon" in sources or "mirrors" in sources else []
@@ -624,6 +754,7 @@ def main() -> int:
                            args.max_pending_downloads)
     finally:
         manifest.save()
+        release_lock(lock_path)
 
     log.info("Done. Summary: %s", json.dumps(counts, indent=2))
     return 1 if counts.get("error") else 0

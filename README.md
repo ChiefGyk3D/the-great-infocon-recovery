@@ -235,6 +235,26 @@ df -h "/path/to/drive"
 
 The HTTP manifest is stored at `<destination>/.infocon_manifest.json` by default. Logs can be placed elsewhere with `--log-file`.
 
+## Robustness
+
+The HTTP sync is built to survive interruptions and large runs:
+
+- **Atomic writes.** Each file downloads to a `.part` sibling and is renamed into place only after its size matches the server's `Content-Length`. A killed or truncated transfer never leaves a file that looks complete.
+- **Per-file retries.** Failed or size-mismatched downloads retry with backoff (`--retries`, default 4). Partial `.part` files resume when the server supports ranges.
+- **Bounded memory.** Download scheduling is capped (`--max-pending-downloads`, default `workers * 4`) so very large trees cannot accumulate hundreds of thousands of in-memory tasks.
+- **Disk-space guard.** A download that would leave less than `--min-free-gib` (default 1) free is refused, and a genuinely full destination halts the run cleanly instead of writing corrupt files.
+- **Periodic manifest saves.** The verification manifest is flushed every 200 completions, so a crash or power loss keeps most hash progress.
+- **Single-instance lock.** A `.infocon_scraper.lock` PID file under the destination prevents two syncs from racing on the same drive. Stale locks (dead PID) are reclaimed automatically; override with `--force`.
+- **Signal handling.** `SIGINT`/`SIGTERM` finish in-flight downloads, save the manifest, and release the lock.
+- **Corruption detection.** A local file whose recorded hash no longer matches is re-downloaded.
+
+Relevant options:
+
+```bash
+python infocon_scraper.py --dest "/path/to/drive" \
+  --retries 6 --download-timeout 7200 --min-free-gib 5
+```
+
 ## Safety Notes
 
 - The tools do not delete remote or local archive content automatically.

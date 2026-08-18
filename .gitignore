@@ -10,3 +10,5 @@ torrent.out
 *.log
 *.torrent
 .infocon_manifest.json
+*.part
+.infocon_scraper.lock
