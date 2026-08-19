@@ -147,13 +147,32 @@ def build_libtorrent_session(settings: TorrentSettings) -> lt.session:
     return lt.session(params)
 
 
+def _run_curl(command: list[str], url: str) -> subprocess.CompletedProcess:
+    """Run curl under the shared per-host concurrency budget.
+
+    Discovery listings compete with the HTTP scraper for the same hosts, so both
+    honour one budget rather than each assuming it has the connection cap to
+    itself.
+    """
+    from infocon_scraper import host_semaphore
+
+    sem = host_semaphore(url)
+    if sem:
+        sem.acquire()
+    try:
+        return subprocess.run(command, capture_output=True, text=False)
+    finally:
+        if sem:
+            sem.release()
+
+
 def curl_text(url: str, settings: TorrentSettings, timeout: int | None = None,
               retries: int | None = None) -> str:
-    proc = subprocess.run(
+    proc = _run_curl(
         ["curl", "-sS", "-A", USER_AGENT, "--retry", str(settings.retries if retries is None else retries),
          "--retry-delay", str(settings.retry_delay), "--retry-all-errors",
          "--max-time", str(timeout or settings.request_timeout), "-L", "--fail", url],
-        capture_output=True, text=False,
+        url,
     )
     if proc.returncode != 0:
         raise RuntimeError(
@@ -164,18 +183,33 @@ def curl_text(url: str, settings: TorrentSettings, timeout: int | None = None,
 
 
 def curl_download(url: str, local_path: str, settings: TorrentSettings) -> None:
-    proc = subprocess.run(
+    proc = _run_curl(
         ["curl", "-sS", "-A", USER_AGENT, "--retry", str(settings.retries),
          "--retry-delay", str(settings.retry_delay), "--retry-all-errors",
          "--max-time", str(settings.request_timeout), "-L", "--fail",
          "-o", local_path, url],
-        capture_output=True, text=False,
+        url,
     )
     if proc.returncode != 0:
         raise RuntimeError(
             f"curl failed ({proc.returncode}) for {url}: "
             f"{proc.stderr.decode(errors='replace').strip()}"
         )
+
+
+def _safe_segment(name: str) -> str | None:
+    """A listing name usable as one path segment, or None if it would escape.
+
+    Names come from the remote listing and are joined onto save_path, so an
+    absolute or traversing name would place torrent content outside the drive.
+    """
+    if not name or name in (os.curdir, os.pardir):
+        return None
+    if os.path.isabs(name) or "/" in name or "\\" in name:
+        return None
+    if os.path.basename(name) != name:
+        return None
+    return name
 
 
 def _listing_entries(html: str) -> list[tuple[str, str, bool]]:
@@ -188,7 +222,11 @@ def _listing_entries(html: str) -> list[tuple[str, str, bool]]:
         href = link.get("href", "")
         if href in ("../", "./") or href.startswith(("?", "http://", "https://")):
             continue
-        entries.append((href, unquote(href.rstrip("/")), href.endswith("/")))
+        name = _safe_segment(unquote(href.rstrip("/")))
+        if name is None:
+            print(f"Ignoring listing entry {href!r}: not a usable path segment")
+            continue
+        entries.append((href, name, href.endswith("/")))
     return entries
 
 
@@ -250,7 +288,11 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
             json.dump(payload, stream, indent=2, sort_keys=True)
         os.replace(temporary, checkpoint_path)
 
-    with ThreadPoolExecutor(max_workers=max(1, min(settings.discovery_workers, 4))) as pool:
+    # Honour the configured worker count. It used to be silently clamped to 4
+    # while the CLI, the wizard and the README all advertised 8.
+    discovery_pool_size = max(1, settings.discovery_workers)
+    print(f"Torrent discovery using {discovery_pool_size} listing worker(s).")
+    with ThreadPoolExecutor(max_workers=discovery_pool_size) as pool:
         for item in pending_items:
             pending[pool.submit(fetch_listing, item)] = (item, 0)
         pending_items = []

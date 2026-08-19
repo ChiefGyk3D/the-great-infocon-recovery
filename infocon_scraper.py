@@ -83,10 +83,11 @@ TOP_LEVEL_SECTIONS = [
     "skills",
     "word lists",
 ]
-# mirrors/ (vx underground malware samples, textfiles.com, etc.) is huge
-# enough on its own to fill a drive and is excluded by default. Pass
-# --only-top mirrors explicitly to include it.
-ALL_TOP_LEVEL_SECTIONS = TOP_LEVEL_SECTIONS + ["mirrors"]
+# Opt-in only: mirrors/ (vx underground malware samples, textfiles.com, etc.)
+# and rainbow tables/ are each large enough to fill a drive on their own, so
+# they are reachable through --only-top but never part of the default set.
+OPT_IN_TOP_LEVEL_SECTIONS = ["mirrors", "rainbow tables"]
+ALL_TOP_LEVEL_SECTIONS = TOP_LEVEL_SECTIONS + OPT_IN_TOP_LEVEL_SECTIONS
 # Priority conference names under cons/: DEF CON first, then any conference
 # whose name contains "bsides" (case-insensitive), then the rest.
 USER_AGENT = "InfoConDriveSync/1.0 (personal archive sync tool)"
@@ -326,7 +327,7 @@ _host_semaphores: dict[str, threading.Semaphore] = {}
 _host_semaphores_lock = threading.Lock()
 
 
-def _host_semaphore(url: str) -> threading.Semaphore | None:
+def host_semaphore(url: str) -> threading.Semaphore | None:
     host = urlparse(url).netloc
     limit = HOST_CONCURRENCY_LIMITS.get(host)
     if not limit:
@@ -353,7 +354,7 @@ def run_curl(args: list[str], timeout: int, url: str | None = None,
         command += ["--speed-limit", str(RUN.min_speed_bytes), "--speed-time", str(RUN.stall_seconds)]
     if timeout and timeout > 0:
         command += ["--max-time", str(timeout)]
-    sem = _host_semaphore(url) if url else None
+    sem = host_semaphore(url) if url else None
     if sem:
         sem.acquire()
     try:
@@ -476,8 +477,89 @@ def _safe_remove(path: str) -> None:
         pass
 
 
+# Both infocon.org and media.defcon.org render dates as "2025 Dec 25 09:30".
+# None of the previously attempted formats matched, so every entry parsed as
+# modified=0.0 and --content-order silently degraded to a name sort.
+LISTING_DATE_FORMATS = (
+    "%Y %b %d %H:%M",
+    "%Y %b %d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+    "%d-%b-%Y %H:%M",
+    "%Y-%b-%d %H:%M",
+)
+# fancyindex prints binary units ("648.6 KiB"); a few themes use decimal ones.
+LISTING_SIZE_UNITS = {
+    "B": 1,
+    "KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30, "TIB": 1 << 40, "PIB": 1 << 50,
+    "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40, "P": 1 << 50,
+    "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3, "TB": 1000 ** 4, "PB": 1000 ** 5,
+}
+
+
+def parse_listing_date(raw: str) -> float:
+    """Epoch seconds from a listing's date cell, or 0.0 when unknown."""
+    text = (raw or "").strip()
+    if not text or text == "-":
+        return 0.0
+    try:
+        numeric = float(text)
+    except ValueError:
+        pass
+    else:
+        # data-sort-value carries a raw epoch on themes that provide it.
+        return numeric if numeric > 1_000_000_000 else 0.0
+    for fmt in LISTING_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+def parse_listing_size(raw: str) -> int | None:
+    """Approximate byte count from a listing's size cell, or None when unknown.
+
+    The published value is rounded ("648.6 KiB"), so this is a scheduling hint -
+    never a substitute for Content-Length when verifying a download.
+    """
+    text = (raw or "").strip()
+    if not text or text == "-":
+        return None
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]*)", text)
+    if not match:
+        return None
+    multiplier = LISTING_SIZE_UNITS.get(match.group(2).upper() or "B")
+    if multiplier is None:
+        return None
+    return int(float(match.group(1)) * multiplier)
+
+
+def safe_child_name(name: str) -> str | None:
+    """A listing name usable as one path segment, or None if it would escape.
+
+    Listing names are remote input joined straight onto the destination path, so
+    an absolute or traversing name would write outside the drive.
+    """
+    if not name or name in (os.curdir, os.pardir):
+        return None
+    if os.path.isabs(name) or "/" in name or "\\" in name:
+        return None
+    if os.path.basename(name) != name:
+        return None
+    return name
+
+
+def _cell_text(cell) -> str:
+    return cell.get("data-sort-value") or cell.get_text(" ", strip=True)
+
+
 def list_directory(url: str) -> list[dict]:
-    """Parse one fancyindex directory listing page into entries."""
+    """Parse one fancyindex directory listing page into entries.
+
+    Each entry carries the published modification time and, when the listing
+    provides it, an approximate size used for download scheduling.
+    """
     html = curl_get_text(url)
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", id="list")
@@ -492,34 +574,42 @@ def list_directory(url: str) -> list[dict]:
         href = link.get("href", "")
         if href in ("../", "./") or href.startswith("?") or href.startswith(("http://", "https://")):
             continue
-        modified = 0.0
-        for cell in tr.find_all("td"):
-            raw_date = cell.get("data-sort-value") or cell.get_text(" ", strip=True)
-            try:
-                modified = float(raw_date)
-                if modified > 1000000000:
+        name = safe_child_name(unquote(href.rstrip("/")))
+        if name is None:
+            log.warning("Ignoring listing entry %r under %s: not a usable path segment", href, url)
+            continue
+
+        cells = tr.find_all("td")
+        date_text = ""
+        size_text = ""
+        for cell in cells:
+            classes = cell.get("class") or []
+            if "date" in classes and not date_text:
+                date_text = _cell_text(cell)
+            elif "size" in classes and not size_text:
+                size_text = _cell_text(cell)
+        modified = parse_listing_date(date_text)
+        if not modified and not date_text:
+            # Theme without a class="date" cell: fall back to scanning cells.
+            for cell in cells:
+                modified = parse_listing_date(_cell_text(cell))
+                if modified:
                     break
-                modified = 0.0
-            except ValueError:
-                pass
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M"):
-                try:
-                    modified = datetime.strptime(raw_date, fmt).timestamp()
-                    break
-                except ValueError:
-                    continue
-            if modified:
-                break
+
         entries.append({
             "href": href,
-            "name": unquote(href.rstrip("/")),
+            "name": name,
             "is_dir": href.endswith("/"),
             "modified": modified,
+            "size": parse_listing_size(size_text),
         })
-    entries.sort(
-        key=lambda entry: (entry["modified"], not entry["is_dir"], entry["name"].lower()),
-        reverse=RUN.content_order == "newest",
-    )
+
+    newest_first = RUN.content_order == "newest"
+    entries.sort(key=lambda entry: (
+        -entry["modified"] if newest_first else entry["modified"],
+        0 if not entry["is_dir"] else 1,  # start transferring before recursing
+        entry["name"].lower(),
+    ))
     return entries
 
 

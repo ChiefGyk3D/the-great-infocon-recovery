@@ -158,6 +158,8 @@ Run the same command again later to refresh the drive. The online directory list
 
 Content discovery defaults to newest-first using the online directory modification metadata, including nested directories. Torrent scheduling also defaults to newest-first. Select `--content-order oldest --torrent-order oldest` for a deliberate historical backfill; the wizard and `.env` expose the same choice.
 
+Listings also publish a rounded file size, which the scraper reads for scheduling and free-space decisions. It is a hint only: verification always uses the exact `Content-Length`.
+
 Useful options:
 
 ```bash
@@ -368,6 +370,7 @@ The HTTP sync is built to survive interruptions and large runs:
 - **Single-instance lock.** A `.infocon_scraper.lock` PID file under the destination prevents two syncs from racing on the same drive. Stale locks (dead PID) are reclaimed automatically; override with `--force`.
 - **Signal handling.** `SIGINT`/`SIGTERM` finish in-flight downloads, save the manifest, and release the lock.
 - **Corruption detection.** A local file whose recorded hash no longer matches is re-downloaded.
+- **Untrusted listing names.** A directory entry whose name is not a single path segment - absolute, or containing a separator or `..` - is ignored instead of being joined onto the destination path.
 
 Relevant options:
 
