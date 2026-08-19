@@ -735,9 +735,13 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
                      include_rainbow_tables=args.torrent_include_rainbow_tables,
                      defcon_only=defcon_only,
                      discovery_event=discovery_event,
-                     index_path=args.torrent_index,
+                     index_path=args.torrent_index or os.path.join(
+                         os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-index.json"
+                     ),
                      index_ttl_hours=max(0, args.torrent_index_ttl_hours),
-                     checkpoint_path=args.torrent_discovery_checkpoint)
+                     checkpoint_path=args.torrent_discovery_checkpoint or os.path.join(
+                         os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-discovery-checkpoint.json"
+                     ))
 
 
 def build_infocon_roots(root_url: str, only_cons: list[str] | None,
