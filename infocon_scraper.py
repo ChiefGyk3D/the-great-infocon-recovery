@@ -718,6 +718,7 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
         retries=3,
         retry_delay=3,
         stalled_minutes=args.torrent_stalled_minutes,
+        discovery_workers=args.torrent_discovery_workers,
     )
     log.info("Running DEF CON torrent phase into %s ...", torrent_dest)
     return fetch_all(dest=torrent_dest,
@@ -967,6 +968,8 @@ def main() -> int:
                          help="DEF CON numbers fetched by combined mode; default: 30,31,32,33,34")
     parser.add_argument("--torrent-include-mirrors", action="store_true",
                          help="Recursively include infocon.org/mirrors torrent files; disabled by default")
+    parser.add_argument("--torrent-discovery-workers", type=int, default=8,
+                         help="Concurrent recursive torrent listing workers (default: 8)")
     parser.add_argument("--manifest", default=None, help="Path to manifest JSON (default: <dest>/.infocon_manifest.json)")
     parser.add_argument("--log-file", default=None, help="Path to log file (default: <dest>/infocon_scraper.log)")
     parser.add_argument("--list-torrents", metavar="NAME",

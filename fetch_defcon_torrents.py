@@ -32,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import unquote, urljoin
@@ -103,6 +104,7 @@ class TorrentSettings:
     retries: int
     retry_delay: int
     stalled_minutes: int = 30
+    discovery_workers: int = 8
 
 
 @dataclass(frozen=True)
@@ -180,39 +182,50 @@ def _listing_entries(html: str) -> list[tuple[str, str, bool]]:
 def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentSettings,
                                 include_mirrors: bool = False) -> list[TorrentSpec]:
     """Recursively find torrent files, excluding the huge mirrors tree by default."""
-    pending = list(roots)
     visited: set[str] = set()
     found: dict[str, tuple[int, TorrentSpec]] = {}
     print(f"Recursive torrent discovery started across {len(roots)} root(s); mirrors={'included' if include_mirrors else 'excluded'}.")
-    while pending:
-        dir_url, save_path = pending.pop()
-        if dir_url in visited:
-            continue
-        visited.add(dir_url)
-        if len(visited) % 100 == 0:
-            print(f"Torrent discovery: scanned {len(visited)} directories, found {len(found)} torrent candidates...")
-        try:
-            html = curl_text(dir_url, settings)
-        except RuntimeError as exc:
-            print(f"Skipping torrent listing {dir_url}: {exc}")
-            continue
-        for href, name, is_dir in _listing_entries(html):
-            child_url = urljoin(dir_url, href)
-            if is_dir:
-                if not include_mirrors and child_url.lower().rstrip("/").endswith("/mirrors"):
+    def fetch_listing(item: tuple[str, str]) -> tuple[str, str, list[tuple[str, str, bool]]]:
+        dir_url, save_path = item
+        return dir_url, save_path, _listing_entries(curl_text(dir_url, settings))
+
+    pending = {}
+    with ThreadPoolExecutor(max_workers=max(1, settings.discovery_workers)) as pool:
+        for item in roots:
+            pending[pool.submit(fetch_listing, item)] = item
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                item = pending.pop(future)
+                dir_url, save_path = item
+                if dir_url in visited:
                     continue
-                pending.append((child_url, os.path.join(save_path, name)))
-                continue
-            if not name.lower().endswith(".torrent"):
-                continue
-            stem = re.sub(r"\s+v\d+\.torrent$", "", name, flags=re.IGNORECASE)
-            key = f"{save_path}/{stem}".lower()
-            candidate = TorrentSpec(name=stem, url=child_url, save_path=save_path)
-            version_match = re.search(r"v(\d+)\.torrent$", name, re.IGNORECASE)
-            version = int(version_match.group(1)) if version_match else 0
-            previous = found.get(key)
-            if previous is None or version > previous[0]:
-                found[key] = (version, candidate)
+                visited.add(dir_url)
+                try:
+                    _, _, entries = future.result()
+                except RuntimeError as exc:
+                    print(f"Skipping torrent listing {dir_url}: {exc}")
+                    continue
+                if len(visited) % 100 == 0:
+                    print(f"Torrent discovery: scanned {len(visited)} directories, found {len(found)} torrent candidates...")
+                for href, name, is_dir in entries:
+                    child_url = urljoin(dir_url, href)
+                    if is_dir:
+                        if not include_mirrors and child_url.lower().rstrip("/").endswith("/mirrors"):
+                            continue
+                        if child_url not in visited:
+                            pending[pool.submit(fetch_listing, (child_url, os.path.join(save_path, name)))] = (child_url, os.path.join(save_path, name))
+                        continue
+                    if not name.lower().endswith(".torrent"):
+                        continue
+                    stem = re.sub(r"\s+v\d+\.torrent$", "", name, flags=re.IGNORECASE)
+                    key = f"{save_path}/{stem}".lower()
+                    candidate = TorrentSpec(name=stem, url=child_url, save_path=save_path)
+                    version_match = re.search(r"v(\d+)\.torrent$", name, re.IGNORECASE)
+                    version = int(version_match.group(1)) if version_match else 0
+                    previous = found.get(key)
+                    if previous is None or version > previous[0]:
+                        found[key] = (version, candidate)
     specs = sorted((spec for _, spec in found.values()), key=lambda spec: torrent_priority(spec.name))
     print(f"Recursive torrent discovery complete: scanned {len(visited)} directories, found {len(specs)} torrent files.")
     return specs
@@ -369,6 +382,8 @@ def main() -> int:
                         help="Comma-separated DEF CON numbers to fetch when recursive roots include other sources")
     parser.add_argument("--include-mirrors", action="store_true",
                         help="Recursively search infocon.org/mirrors too; disabled by default because it is enormous")
+    parser.add_argument("--discovery-workers", type=int, default=8,
+                        help="Concurrent recursive torrent listing workers (default: 8)")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated substrings to skip, useful for archives arriving separately")
     parser.add_argument("--torrents-dir", default=DEFAULT_TORRENTS_CACHE,
@@ -417,6 +432,7 @@ def main() -> int:
         retries=max(0, args.retries),
         retry_delay=max(0, args.retry_delay),
         stalled_minutes=max(1, args.stalled_minutes),
+        discovery_workers=max(1, args.discovery_workers),
     )
     return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip,
                      include_mirrors=args.include_mirrors, defcon_only=defcon_only)
