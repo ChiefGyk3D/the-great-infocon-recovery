@@ -34,10 +34,13 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
+from urllib.parse import unquote, urljoin
 
 import libtorrent as lt
+from bs4 import BeautifulSoup
 
 TORRENTS_DIR_URL = "https://media.defcon.org/DEF%20CON%20Torrents/"
+INFOCON_ROOT_URL = "https://infocon.org/"
 USER_AGENT = "InfoConDriveSync/1.0 (personal archive sync tool)"
 DEFAULT_TORRENTS_CACHE = os.environ.get(
     "INFOCON_TORRENTS_CACHE",
@@ -102,6 +105,13 @@ class TorrentSettings:
     stalled_minutes: int = 30
 
 
+@dataclass(frozen=True)
+class TorrentSpec:
+    name: str
+    url: str
+    save_path: str
+
+
 def build_libtorrent_session(settings: TorrentSettings) -> lt.session:
     """Create a libtorrent session using the settings keys supported by libtorrent 2.1.x.
 
@@ -153,20 +163,54 @@ def curl_download(url: str, local_path: str, settings: TorrentSettings) -> None:
         raise RuntimeError(f"curl failed ({proc.returncode}) for {url}: {proc.stderr.strip()}")
 
 
-def discover_torrents(dir_url: str, settings: TorrentSettings) -> dict[str, str]:
-    """Return {base_name: href} picking the highest 'vN' version per base name."""
-    html = curl_text(dir_url, settings)
-    hrefs = re.findall(r'href="([^"]+\.torrent)"', html)
-    best: dict[str, tuple[int, str]] = {}
-    for href in hrefs:
-        name = href.replace("%20", " ")
-        m = re.match(r"^(.*) v(\d+)\.torrent$", name)
-        if not m:
+def _listing_entries(html: str) -> list[tuple[str, str, bool]]:
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table", id="list")
+    if table is None:
+        return []
+    entries: list[tuple[str, str, bool]] = []
+    for link in (table.find("tbody") or table).find_all("a"):
+        href = link.get("href", "")
+        if href in ("../", "./") or href.startswith(("?", "http://", "https://")):
             continue
-        base, version = m.group(1), int(m.group(2))
-        if base not in best or version > best[base][0]:
-            best[base] = (version, href)
-    return {base: href for base, (_, href) in best.items()}
+        entries.append((href, unquote(href.rstrip("/")), href.endswith("/")))
+    return entries
+
+
+def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentSettings,
+                                include_mirrors: bool = False) -> list[TorrentSpec]:
+    """Recursively find torrent files, excluding the huge mirrors tree by default."""
+    pending = list(roots)
+    visited: set[str] = set()
+    found: dict[str, tuple[int, TorrentSpec]] = {}
+    while pending:
+        dir_url, save_path = pending.pop()
+        if dir_url in visited:
+            continue
+        visited.add(dir_url)
+        try:
+            html = curl_text(dir_url, settings)
+        except RuntimeError as exc:
+            print(f"Skipping torrent listing {dir_url}: {exc}")
+            continue
+        for href, name, is_dir in _listing_entries(html):
+            child_url = urljoin(dir_url, href)
+            if is_dir:
+                if not include_mirrors and child_url.lower().rstrip("/").endswith("/mirrors"):
+                    continue
+                pending.append((child_url, os.path.join(save_path, name)))
+                continue
+            if not name.lower().endswith(".torrent"):
+                continue
+            stem = re.sub(r"\s+v\d+\.torrent$", "", name, flags=re.IGNORECASE)
+            key = f"{save_path}/{stem}".lower()
+            candidate = TorrentSpec(name=stem, url=child_url, save_path=save_path)
+            version_match = re.search(r"v(\d+)\.torrent$", name, re.IGNORECASE)
+            version = int(version_match.group(1)) if version_match else 0
+            previous = found.get(key)
+            if previous is None or version > previous[0]:
+                found[key] = (version, candidate)
+    return sorted((spec for _, spec in found.values()), key=lambda spec: torrent_priority(spec.name))
 
 
 def torrent_priority(name: str) -> tuple[int, int, str]:
@@ -180,19 +224,28 @@ def torrent_priority(name: str) -> tuple[int, int, str]:
 def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               settings: TorrentSettings, ready_event: threading.Event | None = None,
               skip: list[str] | None = None,
-              stalled_callback: Callable[[str], None] | None = None) -> int:
+              stalled_callback: Callable[[TorrentSpec], None] | None = None,
+              torrent_roots: list[tuple[str, str]] | None = None,
+              include_mirrors: bool = False,
+              defcon_only: list[str] | None = None) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
-    available = discover_torrents(TORRENTS_DIR_URL, settings)
+    roots = torrent_roots or [(TORRENTS_DIR_URL, dest)]
+    available = discover_torrents_recursive(roots, settings, include_mirrors=include_mirrors)
     if only:
         filters = [f.lower() for f in only]
-        available = {name: href for name, href in available.items()
-                     if any(f in name.lower() for f in filters)}
+        available = [spec for spec in available if any(f in spec.name.lower() for f in filters)]
+    if defcon_only:
+        filters = [f.lower() for f in defcon_only]
+        available = [
+            spec for spec in available
+            if not spec.save_path.replace(os.sep, "/").lower().endswith("/cons/def con")
+            or any(f in spec.name.lower() for f in filters)
+        ]
     if skip:
         filters = [f.lower() for f in skip]
-        available = {name: href for name, href in available.items()
-                     if not any(f in name.lower() for f in filters)}
+        available = [spec for spec in available if not any(f in spec.name.lower() for f in filters)]
     if not available:
         print("No matching torrents found.")
         return 1
@@ -204,13 +257,16 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     # unlimited (-1 in libtorrent).
     ses = build_libtorrent_session(settings)
     handles = {}
+    specs_by_name = {spec.name: spec for spec in available}
     completed_at: dict[str, float] = {}
     no_activity_since: dict[str, float] = {}
     stalled_names: set[str] = set()
 
-    for name, href in sorted(available.items(), key=lambda item: torrent_priority(item[0])):
-        torrent_url = TORRENTS_DIR_URL + href
-        torrent_path = os.path.join(torrents_dir, f"{name}.torrent")
+    for spec in sorted(available, key=lambda item: torrent_priority(item.name)):
+        name = spec.name
+        torrent_url = spec.url
+        cache_name = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{spec.save_path}_{name}")
+        torrent_path = os.path.join(torrents_dir, f"{cache_name}.torrent")
         if not os.path.exists(torrent_path):
             print(f"Fetching torrent metadata for {name} ...")
             curl_download(torrent_url, torrent_path, settings)
@@ -221,7 +277,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
             continue
         atp = lt.add_torrent_params()
         atp.ti = info
-        atp.save_path = dest
+        atp.save_path = spec.save_path
         h = ses.add_torrent(atp)
         handles[name] = h
         print(f"Added {name}: {info.total_size() / 1e9:.2f} GB, {info.num_files()} files")
@@ -263,7 +319,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                                 stalled_names.add(name)
                                 h.pause()
                                 print(f"Stalled after {quiet_for / 60:.0f} minutes; handing {name} back to HTTP.")
-                                stalled_callback(name)
+                                stalled_callback(specs_by_name[name])
                                 continue
                         else:
                             no_activity_since.pop(name, None)
@@ -304,6 +360,10 @@ def main() -> int:
     parser.add_argument("--only", default=None,
                          help="Comma-separated substrings to restrict which items are fetched "
                               "(default: all available torrents)")
+    parser.add_argument("--defcon-only", default=None,
+                        help="Comma-separated DEF CON numbers to fetch when recursive roots include other sources")
+    parser.add_argument("--include-mirrors", action="store_true",
+                        help="Recursively search infocon.org/mirrors too; disabled by default because it is enormous")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated substrings to skip, useful for archives arriving separately")
     parser.add_argument("--torrents-dir", default=DEFAULT_TORRENTS_CACHE,
@@ -338,6 +398,7 @@ def main() -> int:
 
     only = [f.strip() for f in args.only.split(",") if f.strip()] if args.only else None
     skip = [f.strip() for f in args.skip.split(",") if f.strip()] if args.skip else None
+    defcon_only = [f.strip() for f in args.defcon_only.split(",") if f.strip()] if args.defcon_only else None
     settings = TorrentSettings(
         max_active=args.max_active,
         connections=args.connections,
@@ -352,7 +413,8 @@ def main() -> int:
         retry_delay=max(0, args.retry_delay),
         stalled_minutes=max(1, args.stalled_minutes),
     )
-    return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip)
+    return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip,
+                     include_mirrors=args.include_mirrors, defcon_only=defcon_only)
 
 
 if __name__ == "__main__":

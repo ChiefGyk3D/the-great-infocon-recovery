@@ -110,7 +110,7 @@ python -m pip install -r requirements.txt
 
 ## HTTP Sync
 
-Run an incremental full sync. Replace the destination with the mount point on your system:
+Run an incremental full sync. Directory listings are ordered by their published modification metadata, newest first, including nested subdirectories. Replace the destination with the mount point on your system:
 
 ```bash
 python infocon_scraper.py \
@@ -149,6 +149,8 @@ python infocon_scraper.py --dest "/path/to/drive" --dry-run
 
 The HTTP scraper uses separate directory-listing and download worker pools. It streams work as directories are discovered, so later large trees do not block priority content. Requests to `media.defcon.org` are capped to avoid server throttling. Download scheduling is bounded so very large trees do not create hundreds of thousands of in-memory futures.
 
+The default HTTP settings already use bounded crawl/download pools and host concurrency limits. Increase `--workers` only when the source and disk can handle it; raising it too far can trigger remote connection timeouts rather than improving throughput.
+
 Tune HTTP concurrency for a particular machine or network:
 
 ```bash
@@ -168,6 +170,8 @@ python infocon_scraper.py --dest "/path/to/drive" \
 ## DEF CON Torrents
 
 The per-archive torrents are BitTorrent v2 metadata. Older distro versions of `aria2c` and `transmission-cli` may reject them, so the helper uses Python `libtorrent`.
+
+Combined mode recursively searches the InfoCon tree for `.torrent` files, including nested paths such as `documentaries/Hacker Movies/`. It excludes `mirrors/` by default because that tree is enormous; opt in with `--torrent-include-mirrors`. Torrent content is saved beneath the matching source-relative destination tree rather than flattened into `cons/DEF CON`.
 
 Fetch and verify every available DEF CON torrent:
 
@@ -226,10 +230,11 @@ To use the torrent-backed DEF CON content as the authoritative source while fill
 ```bash
 python infocon_scraper.py \
   --dest "/path/to/InfoCon drive" \
-  --with-torrents
+  --with-torrents \
+  --torrent-defcon-only "30,31,32,33,34"
 ```
 
-The combined workflow adds all available DEF CON torrents and immediately crawls non-DEF CON content while their initial file checking runs. Once every torrent leaves its checking states, HTTP crawls the torrentless DEF CON remainder while libtorrent continues downloading the checked torrent content. HTTP automatically skips DEF CON folders represented by torrents, so the two phases do not intentionally duplicate those archives. A single drive-level lock remains held by the parent process until both phases finish.
+The combined workflow adds DEF CON 30–34 by default and also discovers non-mirror InfoCon torrents recursively. It immediately crawls non-DEF CON content while torrent files are checked. Once checking finishes, HTTP crawls the torrentless DEF CON remainder while libtorrent continues downloading. A single drive-level lock remains held by the parent process until all phases finish.
 
 Torrent archives are added newest first by DEF CON number. Skip archives that are arriving separately, such as a physical DEF CON or BSides delivery, with one filter applied to both HTTP roots and torrents:
 

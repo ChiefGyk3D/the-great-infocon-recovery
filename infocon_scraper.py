@@ -56,6 +56,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Callable
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -423,11 +424,31 @@ def list_directory(url: str) -> list[dict]:
         href = link.get("href", "")
         if href in ("../", "./") or href.startswith("?") or href.startswith(("http://", "https://")):
             continue
+        modified = 0.0
+        for cell in tr.find_all("td"):
+            raw_date = cell.get("data-sort-value") or cell.get_text(" ", strip=True)
+            try:
+                modified = float(raw_date)
+                if modified > 1000000000:
+                    break
+                modified = 0.0
+            except ValueError:
+                pass
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M"):
+                try:
+                    modified = datetime.strptime(raw_date, fmt).timestamp()
+                    break
+                except ValueError:
+                    continue
+            if modified:
+                break
         entries.append({
             "href": href,
             "name": unquote(href.rstrip("/")),
             "is_dir": href.endswith("/"),
+            "modified": modified,
         })
+    entries.sort(key=lambda entry: (entry["modified"], not entry["is_dir"], entry["name"].lower()), reverse=True)
     return entries
 
 
@@ -679,6 +700,11 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
         return 1
 
     torrent_dest = os.path.join(dest_root, "cons", "DEF CON")
+    torrent_roots = [
+        ("https://media.defcon.org/DEF%20CON%20Torrents/", torrent_dest),
+        ("https://infocon.org/", dest_root),
+    ]
+    defcon_only = [f.strip() for f in args.torrent_defcon_only.split(",") if f.strip()]
     settings = TorrentSettings(
         max_active=args.torrent_max_active,
         connections=args.torrent_connections,
@@ -697,7 +723,8 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
     return fetch_all(dest=torrent_dest,
                      torrents_dir=os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrents"),
                      only=only, settings=settings, ready_event=ready_event, skip=skip,
-                     stalled_callback=stalled_callback)
+                     stalled_callback=stalled_callback, torrent_roots=torrent_roots,
+                     include_mirrors=args.torrent_include_mirrors, defcon_only=defcon_only)
 
 
 def build_infocon_roots(root_url: str, only_cons: list[str] | None,
@@ -936,6 +963,10 @@ def main() -> int:
                          help="If --with-torrents is set, minutes to seed after completion (default: 0)")
     parser.add_argument("--torrent-stalled-minutes", type=int, default=30,
                          help="If --with-torrents is set, hand zero-peer/zero-rate torrents to HTTP after this many minutes (default: 30)")
+    parser.add_argument("--torrent-defcon-only", default="30,31,32,33,34",
+                         help="DEF CON numbers fetched by combined mode; default: 30,31,32,33,34")
+    parser.add_argument("--torrent-include-mirrors", action="store_true",
+                         help="Recursively include infocon.org/mirrors torrent files; disabled by default")
     parser.add_argument("--manifest", default=None, help="Path to manifest JSON (default: <dest>/.infocon_manifest.json)")
     parser.add_argument("--log-file", default=None, help="Path to log file (default: <dest>/infocon_scraper.log)")
     parser.add_argument("--list-torrents", metavar="NAME",
@@ -1037,9 +1068,11 @@ def main() -> int:
             torrent_only = only_cons or None
             torrent_ready = threading.Event()
 
-            def run_stalled_http_fallback(name: str) -> None:
-                root = build_defcon_media_fallback_root(args.defcon_media_url, name)
-                log.warning("Torrent %s is stalled; starting HTTP fallback for %s", name, root[1])
+            def run_stalled_http_fallback(spec) -> None:
+                fallback_url = urljoin(spec.url, "./")
+                relative_root = os.path.relpath(spec.save_path, args.dest)
+                root = (fallback_url, relative_root)
+                log.warning("Torrent %s is stalled; starting HTTP fallback for %s", spec.name, root[1])
                 result = run_sync(
                     [root], args.dest, manifest, args.crawl_workers, args.workers,
                     args.verify_all, args.dry_run, stop_requested, [],
@@ -1051,8 +1084,8 @@ def main() -> int:
 
             def start_stalled_http_fallback(name: str) -> None:
                 thread = threading.Thread(
-                    target=run_stalled_http_fallback, args=(name,),
-                    name=f"http-fallback-{name}", daemon=False
+                    target=run_stalled_http_fallback, args=(spec,),
+                    name=f"http-fallback-{spec.name}", daemon=False
                 )
                 fallback_threads.append(thread)
                 thread.start()
