@@ -9,7 +9,8 @@ This project is licensed under the GNU General Public License v3.0. See [LICENSE
 `infocon_scraper.py` mirrors:
 
 - All conferences under `infocon.org/cons/`, with DEF CON and BSides submitted first.
-- `documentaries/`, `podcasts/`, `rainbow tables/`, `skills/`, and `word lists/`.
+- `documentaries/`, `podcasts/`, `skills/`, and `word lists/` by default.
+- `rainbow tables/` only when explicitly requested; it is a separate multi-terabyte dataset.
 - Selected folders from `media.defcon.org`, normally DEF CON content that is missing from InfoCon.
 - Nested files into their corresponding source folders. It does not flatten archives into a new top-level namespace.
 
@@ -45,9 +46,19 @@ The current six-drive DDV layout is:
 | E | 8 TB | NTLM-9 hash tables | Separate companion dataset |
 | F | 6 TB | 4.2 Net NTLMv1 rainbow table | Separate companion dataset |
 
-Drive A is the InfoCon archive this project is designed to build. Drive D's VX Underground material is represented by the relevant mirror collections described below. Drives B, C, E, and F are separate hash-table datasets and are not automatically supplied by `infocon_scraper.py`; keep them in their own destination trees rather than combining them with the InfoCon mirror.
+Drive A is the InfoCon archive this project rebuilds so people can recover the conference archive even when they cannot attend DEF CON in person. Drive D's VX Underground material is represented by the relevant mirror collections described below. Drives B, C, E, and F are separate hash-table datasets and are not automatically supplied by `infocon_scraper.py`; keep them in their own destination trees rather than combining them with the InfoCon mirror.
 
-The normal top-level `rainbow tables/` section may contain related material, but it should not be treated as a complete replacement for Drives B, C, E, or F without checking the source inventory.
+The `rainbow tables/` directory is the authoritative source for the separate hash-table datasets. Its README lists A51 (1.5 TB), LANMAN (0.4 TB), MD5 (3.5 TB), MySQL SHA-1 (1.3 TB), NTLM (3.6 TB), NTLM 9 (6.7 TB), and NetNTLMv1 (4.3 TB compressed from 8 TB). It is excluded from the default archive crawl and torrent inventory because it is a separate multi-terabyte drive workload. Opt in explicitly:
+
+```bash
+python infocon_scraper.py --dest "/path/to/drive" \
+  --only-top "rainbow tables"
+
+python fetch_defcon_torrents.py --dest "/path/to/drive" \
+  --include-rainbow-tables
+```
+
+The Rainbow Tables schema should be kept as separate DDV source-drive content: LANMAN/MSSQL/NTLM on Drive B, A5/1/GSM/MD5 on Drive C, NTLM-9 on Drive E, and the 4.2 Net-NTLMv1 table on Drive F. Do not place these datasets under Drive A's InfoCon archive tree.
 
 To target the DDV-related mirror collection without crawling every conference:
 
@@ -110,12 +121,42 @@ python -m pip install -r requirements.txt
 
 ## HTTP Sync
 
-Run an incremental full sync. Replace the destination with the mount point on your system:
+### Fresh Builds and Refreshes
+
+The destination may be completely empty. The online InfoCon and media sources are authoritative; existing files are only used to resume and verify. The same command can be rerun later to keep a drive current as new conferences, talks, torrents, and corrections appear.
+
+Use the single friendly entrypoint for normal users:
+
+```bash
+./.venv/bin/python bin/infocon.py
+```
+
+It opens a numbered wizard for destination, refresh scope, HTTP workers, torrent scope, stalled-torrent fallback, and Rainbow Tables confirmation. For repeat runs, copy `.env.example` to `.env`, edit it once, then use:
+
+```bash
+./.venv/bin/python bin/infocon.py --repeat
+```
+
+Advanced users can bypass the wizard and use the full scraper CLI:
+
+```bash
+./.venv/bin/python bin/infocon.py --advanced --dest "/path/to/drive" --with-torrents
+```
+
+Rainbow Tables remain excluded unless explicitly enabled in the wizard or `.env`.
+
+The scraper does not use the existing drive as an inventory and does not require any pre-existing folders, torrent files, or manifest. It creates the destination tree as it discovers the current online InfoCon layout.
+
+Run an incremental full sync. Directory listings are ordered by their published modification metadata, newest first, including nested subdirectories. Replace the destination with the mount point on your system:
 
 ```bash
 python infocon_scraper.py \
   --dest "/path/to/InfoCon drive"
 ```
+
+Run the same command again later to refresh the drive. The online directory listings and torrent inventories are checked again; files already verified in the destination manifest are skipped, changed/new files are added, and interrupted `.part` downloads resume. A 2022-era drive is therefore only a resume/cache advantage, never a limit on what the current online scan can discover.
+
+Content discovery defaults to newest-first using the online directory modification metadata, including nested directories. Torrent scheduling also defaults to newest-first. Select `--content-order oldest --torrent-order oldest` for a deliberate historical backfill; the wizard and `.env` expose the same choice.
 
 Useful options:
 
@@ -149,6 +190,8 @@ python infocon_scraper.py --dest "/path/to/drive" --dry-run
 
 The HTTP scraper uses separate directory-listing and download worker pools. It streams work as directories are discovered, so later large trees do not block priority content. Requests to `media.defcon.org` are capped to avoid server throttling. Download scheduling is bounded so very large trees do not create hundreds of thousands of in-memory futures.
 
+The default HTTP settings already use bounded crawl/download pools and host concurrency limits. Increase `--workers` only when the source and disk can handle it; raising it too far can trigger remote connection timeouts rather than improving throughput.
+
 Tune HTTP concurrency for a particular machine or network:
 
 ```bash
@@ -168,6 +211,8 @@ python infocon_scraper.py --dest "/path/to/drive" \
 ## DEF CON Torrents
 
 The per-archive torrents are BitTorrent v2 metadata. Older distro versions of `aria2c` and `transmission-cli` may reject them, so the helper uses Python `libtorrent`.
+
+Combined mode recursively searches the current online InfoCon tree for `.torrent` files, including nested paths such as `documentaries/Hacker Movies/`, regardless of whether those files or folders exist on the destination drive. It excludes `mirrors/` and `rainbow tables/` by default because those are separate enormous workloads; opt in with `--torrent-include-mirrors` and/or `--torrent-include-rainbow-tables`. Torrent content is saved beneath the matching source-relative destination tree rather than flattened into `cons/DEF CON`.
 
 Fetch and verify every available DEF CON torrent:
 
@@ -226,12 +271,13 @@ To use the torrent-backed DEF CON content as the authoritative source while fill
 ```bash
 python infocon_scraper.py \
   --dest "/path/to/InfoCon drive" \
-  --with-torrents
+  --with-torrents \
+  --torrent-defcon-only "30,31,32,33,34"
 ```
 
-The combined workflow adds all available DEF CON torrents and immediately crawls non-DEF CON content while their initial file checking runs. Once every torrent leaves its checking states, HTTP crawls the torrentless DEF CON remainder while libtorrent continues downloading the checked torrent content. HTTP automatically skips DEF CON folders represented by torrents, so the two phases do not intentionally duplicate those archives. A single drive-level lock remains held by the parent process until both phases finish.
+The combined workflow adds DEF CON 30–34 by default and also discovers non-mirror InfoCon torrents recursively. It immediately crawls non-DEF CON content while torrent files are checked. Once checking finishes, HTTP crawls the torrentless DEF CON remainder while libtorrent continues downloading. A single drive-level lock remains held by the parent process until all phases finish.
 
-Torrent archives are added newest first by DEF CON number. Skip archives that are arriving separately, such as a physical DEF CON or BSides delivery, with one filter applied to both HTTP roots and torrents:
+Torrent archives are added newest first by DEF CON number. Skip archives that are arriving separately, such as a physical DEF CON or BSides delivery, from torrent ownership so HTTP downloads them:
 
 ```bash
 python infocon_scraper.py \
@@ -240,7 +286,7 @@ python infocon_scraper.py \
   --skip-recent "DEF CON 34,BSides Las Vegas 2026"
 ```
 
-The skip list is intentionally explicit so it can be changed each year when a new DEF CON torrent or physical conference delivery becomes available. The standalone torrent helper accepts the equivalent `--skip` option.
+The skip list is intentionally explicit so it can be changed each year when a new DEF CON torrent or physical conference delivery becomes available. It does not exclude those paths from HTTP. The standalone torrent helper accepts the equivalent `--skip` option.
 
 If a torrent has finished checking but stays at zero peers and zero download rate, combined mode pauses it and hands that archive's media folder back to HTTP after 30 minutes by default. Tune the fallback window when needed:
 
@@ -262,8 +308,8 @@ DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and an
 Run jobs detached if desired:
 
 ```bash
-nohup python infocon_scraper.py --dest "/path/to/drive" > run.out 2>&1 &
-nohup python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" > torrent.out 2>&1 &
+nohup python infocon_scraper.py --dest "/path/to/drive" >> run.out 2>&1 &
+nohup python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" >> torrent.out 2>&1 &
 ```
 
 Watch them live:
@@ -278,7 +324,7 @@ df -h "/path/to/drive"
 For a detached overview with mount health, free-space/inode alerts, torrent cache size, worker CPU/memory/threads/fds/disk I/O, and recent errors:
 
 ```bash
-nohup ./monitor_infocon.sh > monitor-daemon.log 2>&1 &
+nohup ./monitoring/monitor_infocon.sh > monitor-daemon.log 2>&1 &
 tail -f infocon-monitor.out
 ```
 
@@ -287,8 +333,8 @@ The overview defaults to `/media/chiefgyk3d/infocon.org DC30`. Override it with 
 For a persistent detachable six-pane dashboard, start it once with the setup script, which creates the tmux session and starts the overview daemon above if it isn't already running:
 
 ```bash
-./start-dashboard.sh
-./tmux-infocon.sh attach -t infocon-monitor
+./bin/start-dashboard.sh
+./bin/tmux-infocon.sh attach -t infocon-monitor
 ```
 
 The panes are:
@@ -302,7 +348,7 @@ The panes are:
 | HTTP status | `monitor_http_status.sh` | Live progress bar, discovered/downloaded/skipped/error counts, `.part` staging probe, recent HTTP failures |
 | BitTorrent status | `monitor_torrent_status.sh` | Active downloads always shown in full; checking/queued torrents truncated with a remaining count; state-count summary |
 
-The overview pane just tails a snapshot file (`infocon-monitor.out`) written by the separate `monitor_infocon.sh` daemon, so that daemon must be running for the overview pane to show live data; `start-dashboard.sh` starts it automatically if it isn't already. The network and disk panes default to `eno1` and `sdc`; `start-dashboard.sh` reads `INFOCON_NETWORK_INTERFACE` and `INFOCON_DISK_DEVICE` and passes them through. Running `monitor_network_io.sh` or `monitor_disk_io.sh` directly instead takes the interface/device as a positional argument, e.g. `./monitor_disk_io.sh nvme0n1 10`. The torrent pane truncates checking/queued entries at `INFOCON_TORRENT_MAX_IDLE_LINES` (default 10). Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with `./tmux-infocon.sh attach -t infocon-monitor`, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
+The overview pane just tails a snapshot file (`infocon-monitor.out`) written by the separate `monitoring/monitor_infocon.sh` daemon, so that daemon must be running for the overview pane to show live data; `bin/start-dashboard.sh` starts it automatically if it isn't already. The network and disk panes default to `eno1` and `sdc`; `bin/start-dashboard.sh` reads `INFOCON_NETWORK_INTERFACE` and `INFOCON_DISK_DEVICE` and passes them through. Running `monitoring/monitor_network_io.sh` or `monitoring/monitor_disk_io.sh` directly instead takes the interface/device as a positional argument, e.g. `./monitoring/monitor_disk_io.sh nvme0n1 10`. The torrent pane truncates checking/queued entries at `INFOCON_TORRENT_MAX_IDLE_LINES` (default 10). Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with `./bin/tmux-infocon.sh attach -t infocon-monitor`, list sessions with `./bin/tmux-infocon.sh ls`, and stop only the dashboard with `./bin/tmux-infocon.sh kill-session -t infocon-monitor`.
 
 The HTTP manifest is stored at `<destination>/.infocon_manifest.json` by default. Logs can be placed elsewhere with `--log-file`.
 
