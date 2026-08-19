@@ -251,12 +251,14 @@ def torrent_logical_name(name: str) -> str:
 
 
 def torrent_source_priority(spec: TorrentSpec) -> int:
-    """Prefer the canonical DEF CON Torrents directory over mirrored copies."""
+    """Prefer media.defcon.org for every DEF CON archive."""
+    if "media.defcon.org" in spec.url.lower():
+        return 0
     path = spec.save_path.replace(os.sep, "/").lower().rstrip("/")
     if path.endswith("/cons/def con/def con torrents"):
-        return 0
-    if path.endswith("/cons/def con"):
         return 1
+    if path.endswith("/cons/def con"):
+        return 2
     return 2
 
 
