@@ -226,13 +226,21 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                     logical = torrent_logical_name(stem)
                     key = f"defcon/{logical}" if logical.startswith("def con") else f"{save_path}/{logical}".lower()
                     previous = found.get(key)
+                    category = "DEF CON" if re.search(r"\bdef con\b", stem, re.IGNORECASE) else "InfoCon"
+                    print(f"Torrent candidate [{category}]: {child_url} -> {save_path} (v{version or 1})")
                     if previous is None or version > previous[0] or (
                         version == previous[0]
                         and torrent_source_priority(candidate) < torrent_source_priority(previous[1])
                     ):
                         found[key] = (version, candidate)
+                        if previous is not None:
+                            print(f"Torrent candidate replaced: {previous[1].url} -> {child_url}")
+                    else:
+                        print(f"Torrent candidate ignored: duplicate/lower-priority {child_url}")
     specs = sorted((spec for _, spec in found.values()), key=lambda spec: torrent_priority(spec.name))
     print(f"Recursive torrent discovery complete: scanned {len(visited)} directories, found {len(specs)} torrent files.")
+    for spec in specs:
+        print(f"Torrent selected for download: {spec.name} -> {spec.url} -> {spec.save_path}")
     return specs
 
 
