@@ -205,7 +205,10 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                 pending_items = [tuple(item) for item in checkpoint.get("pending", [])]
                 found = {key: (value["version"], TorrentSpec(**value["spec"]))
                          for key, value in checkpoint.get("found", {}).items()}
-                print(f"Resuming torrent discovery checkpoint: {len(visited)} directories visited, {len(pending_items)} pending, {len(found)} candidates.")
+                print(
+                    f"Resuming torrent discovery checkpoint: {len(visited)} directories visited, "
+                    f"{len(pending_items)} saved pending URLs (not a total), {len(found)} known candidates."
+                )
         except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError, KeyError):
             pass
     print(f"Recursive torrent discovery started across {len(roots)} root(s); mirrors={'included' if include_mirrors else 'excluded'}, rainbow tables={'included' if include_rainbow_tables else 'excluded'}.")
