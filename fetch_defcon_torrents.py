@@ -616,7 +616,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
             active.sort(key=lambda item: (-item[0], -item[1], -item[2], torrent_order_key(item[4], settings.torrent_order)))
             if checking_complete and not scheduler_locked:
                 for handle in handles.values():
-                    handle.set_auto_managed(False)
+                    handle.unset_flags(lt.torrent_flags.auto_managed)
                 scheduler_locked = True
             if checking_complete:
                 incomplete = [

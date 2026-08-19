@@ -338,6 +338,16 @@ class TestTorrentCurlText(unittest.TestCase):
         self.assertIn("\ufffd", html)
 
 
+class TestLibtorrentCompatibility(unittest.TestCase):
+
+    def test_torrent_handle_supports_auto_managed_flag_control(self):
+        import libtorrent as lt
+
+        self.assertTrue(hasattr(lt.torrent_handle, "unset_flags"))
+        self.assertTrue(hasattr(lt.torrent_flags, "auto_managed"))
+        self.assertFalse(hasattr(lt.torrent_handle, "set_auto_managed"))
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
