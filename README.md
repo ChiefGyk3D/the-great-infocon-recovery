@@ -288,7 +288,7 @@ python infocon_scraper.py \
 
 The skip list is intentionally explicit so it can be changed each year when a new DEF CON torrent or physical conference delivery becomes available. It does not exclude those paths from HTTP. The standalone torrent helper accepts the equivalent `--skip` option.
 
-If a torrent has finished checking but stays at zero peers and zero download rate, combined mode pauses it and hands that archive's media folder back to HTTP after 30 minutes by default. Tune the fallback window when needed:
+If a torrent the scheduler is actively running stays at zero peers and zero download rate, combined mode pauses it and hands that archive's own folder back to HTTP after 30 minutes by default. Only torrents in the active set are timed: an archive queued behind `--torrent-max-active` reports zero peers because it has not been started yet, not because it is dead, so its quiet timer does not run until it is promoted. Tune the fallback window when needed:
 
 ```bash
 python infocon_scraper.py \
@@ -298,6 +298,8 @@ python infocon_scraper.py \
 ```
 
 This fallback only applies to torrents that are actually stalled; active torrents and completed torrents remain torrent-authoritative. A standalone `fetch_defcon_torrents.py` run has no HTTP fallback and will continue waiting for its torrent set.
+
+A fallback crawls the stalled archive's own content folder and nothing wider. `cons/2600 archive v1 - infocon.org.torrent` falls back to `cons/2600/`, not to all of `cons/`, and DEF CON archives fall back to their `media.defcon.org` year folder. Fallbacks are also skipped entirely when the ordinary sync already covers that path, deduplicated by root, and run one at a time on a shared queue, so a swarm of stalled torrents cannot multiply into concurrent crawls of the same tree.
 
 DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and any special folders not represented by torrents.
 
@@ -358,6 +360,8 @@ The HTTP sync is built to survive interruptions and large runs:
 
 - **Atomic writes.** Each file downloads to a `.part` sibling and is renamed into place only after its size matches the server's `Content-Length`. A killed or truncated transfer never leaves a file that looks complete.
 - **Per-file retries.** Failed or size-mismatched downloads retry with backoff (`--retries`, default 4). Partial `.part` files resume when the server supports ranges.
+- **Stall detection, not wall-clock caps.** A transfer is abandoned only when it averages under `--min-speed-bytes` (default 1024) for `--stall-timeout` seconds (default 300). There is no hard per-attempt time limit by default, because the largest word lists need many hours and an aborted attempt restarts from the beginning; set `--download-timeout` if you want one anyway.
+- **One writer per file.** Concurrent HTTP phases can discover the same file; only one worker is ever allowed to stage a given destination path, so two transfers can never share a `.part`.
 - **Bounded memory.** Download scheduling is capped (`--max-pending-downloads`, default `workers * 4`) so very large trees cannot accumulate hundreds of thousands of in-memory tasks.
 - **Disk-space guard.** A download that would leave less than `--min-free-gib` (default 1) free is refused, and a genuinely full destination halts the run cleanly instead of writing corrupt files.
 - **Periodic manifest saves.** The verification manifest is flushed every 200 completions, so a crash or power loss keeps most hash progress.
@@ -369,7 +373,7 @@ Relevant options:
 
 ```bash
 python infocon_scraper.py --dest "/path/to/drive" \
-  --retries 6 --download-timeout 7200 --min-free-gib 5
+  --retries 6 --stall-timeout 600 --min-free-gib 5
 ```
 
 ## Safety Notes
