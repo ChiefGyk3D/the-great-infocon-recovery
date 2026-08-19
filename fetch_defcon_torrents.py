@@ -219,12 +219,16 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                     if not name.lower().endswith(".torrent"):
                         continue
                     stem = re.sub(r"\s+v\d+\.torrent$", "", name, flags=re.IGNORECASE)
-                    key = f"{save_path}/{stem}".lower()
                     candidate = TorrentSpec(name=stem, url=child_url, save_path=save_path)
                     version_match = re.search(r"v(\d+)\.torrent$", name, re.IGNORECASE)
                     version = int(version_match.group(1)) if version_match else 0
+                    logical = torrent_logical_name(stem)
+                    key = f"defcon/{logical}" if logical.startswith("def con") else f"{save_path}/{logical}".lower()
                     previous = found.get(key)
-                    if previous is None or version > previous[0]:
+                    if previous is None or version > previous[0] or (
+                        version == previous[0]
+                        and torrent_source_priority(candidate) < torrent_source_priority(previous[1])
+                    ):
                         found[key] = (version, candidate)
     specs = sorted((spec for _, spec in found.values()), key=lambda spec: torrent_priority(spec.name))
     print(f"Recursive torrent discovery complete: scanned {len(visited)} directories, found {len(specs)} torrent files.")
@@ -237,6 +241,22 @@ def torrent_priority(name: str) -> tuple[int, int, str]:
     if match:
         return (0, -int(match.group(1)), name.lower())
     return (1, 0, name.lower())
+
+
+def torrent_logical_name(name: str) -> str:
+    """Normalize archive labels so duplicate published torrent locations collapse."""
+    normalized = re.sub(r"\s+archive(?:\s+v\d+)?(?:\s+-\s+infocon\.org)?$", "", name, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+def torrent_source_priority(spec: TorrentSpec) -> int:
+    """Prefer the canonical DEF CON Torrents directory over mirrored copies."""
+    path = spec.save_path.replace(os.sep, "/").lower().rstrip("/")
+    if path.endswith("/cons/def con/def con torrents"):
+        return 0
+    if path.endswith("/cons/def con"):
+        return 1
+    return 2
 
 
 def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
@@ -258,7 +278,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
         filters = [f.lower() for f in defcon_only]
         available = [
             spec for spec in available
-            if not spec.save_path.replace(os.sep, "/").lower().endswith("/cons/def con")
+            if not re.search(r"\bdef con\b", spec.name, re.IGNORECASE)
             or any(f in spec.name.lower() for f in filters)
         ]
     if skip:
@@ -268,7 +288,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
         print("No matching torrents found.")
         return 1
 
-    print(f"Found {len(available)} torrents to fetch/verify.")
+    defcon_count = sum(1 for spec in available if re.search(r"\bdef con\b", spec.name, re.IGNORECASE))
+    print(f"Found {len(available)} torrents to fetch/verify ({defcon_count} DEF CON, {len(available) - defcon_count} other InfoCon torrents).")
     # libtorrent auto-manages torrents and by default only actively downloads a
     # few at once (active_downloads=3); the rest sit queued with 0 peers. Raise
     # the limits so the whole set downloads in parallel. max_active <= 0 means

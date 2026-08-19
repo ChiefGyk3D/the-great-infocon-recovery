@@ -110,12 +110,16 @@ python -m pip install -r requirements.txt
 
 ## HTTP Sync
 
+The destination may be a completely empty drive. The scraper does not use the existing drive as an inventory and does not require any pre-existing folders, torrent files, or manifest. It creates the destination tree as it discovers the current online InfoCon layout.
+
 Run an incremental full sync. Directory listings are ordered by their published modification metadata, newest first, including nested subdirectories. Replace the destination with the mount point on your system:
 
 ```bash
 python infocon_scraper.py \
   --dest "/path/to/InfoCon drive"
 ```
+
+Run the same command again later to refresh the drive. The online directory listings and torrent inventories are checked again; files already verified in the destination manifest are skipped, changed/new files are added, and interrupted `.part` downloads resume. A 2022-era drive is therefore only a resume/cache advantage, never a limit on what the current online scan can discover.
 
 Useful options:
 
@@ -171,7 +175,7 @@ python infocon_scraper.py --dest "/path/to/drive" \
 
 The per-archive torrents are BitTorrent v2 metadata. Older distro versions of `aria2c` and `transmission-cli` may reject them, so the helper uses Python `libtorrent`.
 
-Combined mode recursively searches the InfoCon tree for `.torrent` files, including nested paths such as `documentaries/Hacker Movies/`. It excludes `mirrors/` by default because that tree is enormous; opt in with `--torrent-include-mirrors`. Torrent content is saved beneath the matching source-relative destination tree rather than flattened into `cons/DEF CON`.
+Combined mode recursively searches the current online InfoCon tree for `.torrent` files, including nested paths such as `documentaries/Hacker Movies/`, regardless of whether those files or folders exist on the destination drive. It excludes `mirrors/` by default because that tree is enormous; opt in with `--torrent-include-mirrors`. Torrent content is saved beneath the matching source-relative destination tree rather than flattened into `cons/DEF CON`.
 
 Fetch and verify every available DEF CON torrent:
 
