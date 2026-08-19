@@ -308,8 +308,8 @@ DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and an
 Run jobs detached if desired:
 
 ```bash
-nohup python infocon_scraper.py --dest "/path/to/drive" > run.out 2>&1 &
-nohup python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" > torrent.out 2>&1 &
+nohup python infocon_scraper.py --dest "/path/to/drive" >> run.out 2>&1 &
+nohup python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" >> torrent.out 2>&1 &
 ```
 
 Watch them live:

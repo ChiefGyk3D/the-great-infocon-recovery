@@ -184,19 +184,54 @@ def _listing_entries(html: str) -> list[tuple[str, str, bool]]:
 
 def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentSettings,
                                 include_mirrors: bool = False,
-                                include_rainbow_tables: bool = False) -> list[TorrentSpec]:
+                                include_rainbow_tables: bool = False,
+                                checkpoint_path: str | None = None) -> list[TorrentSpec]:
     """Recursively find torrent files, excluding mirrors and rainbow tables by default."""
     visited: set[str] = set()
     found: dict[str, tuple[int, TorrentSpec]] = {}
+    pending_items = list(roots)
+    fingerprint = {"roots": [list(root) for root in roots], "include_mirrors": include_mirrors,
+                   "include_rainbow_tables": include_rainbow_tables}
+    if checkpoint_path:
+        try:
+            with open(checkpoint_path, "r", encoding="utf-8") as stream:
+                checkpoint = json.load(stream)
+            if checkpoint.get("fingerprint") == fingerprint:
+                visited = set(checkpoint.get("visited", []))
+                pending_items = [tuple(item) for item in checkpoint.get("pending", [])]
+                found = {key: (value["version"], TorrentSpec(**value["spec"]))
+                         for key, value in checkpoint.get("found", {}).items()}
+                print(f"Resuming torrent discovery checkpoint: {len(visited)} directories visited, {len(pending_items)} pending, {len(found)} candidates.")
+        except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError, KeyError):
+            pass
     print(f"Recursive torrent discovery started across {len(roots)} root(s); mirrors={'included' if include_mirrors else 'excluded'}, rainbow tables={'included' if include_rainbow_tables else 'excluded'}.")
     def fetch_listing(item: tuple[str, str]) -> tuple[str, str, list[tuple[str, str, bool]]]:
         dir_url, save_path = item
         return dir_url, save_path, _listing_entries(curl_text(dir_url, settings))
 
     pending = {}
+    last_checkpoint = time.time()
+
+    def save_checkpoint() -> None:
+        if not checkpoint_path:
+            return
+        payload = {
+            "fingerprint": fingerprint,
+            "visited": sorted(visited),
+            "pending": [list(item) for item in pending_items] + [list(item) for item in pending.values()],
+            "found": {key: {"version": version, "spec": spec.__dict__}
+                      for key, (version, spec) in found.items()},
+        }
+        os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+        temporary = checkpoint_path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True)
+        os.replace(temporary, checkpoint_path)
+
     with ThreadPoolExecutor(max_workers=max(1, settings.discovery_workers)) as pool:
-        for item in roots:
+        for item in pending_items:
             pending[pool.submit(fetch_listing, item)] = item
+        pending_items = []
         while pending:
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
@@ -245,6 +280,10 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                         print(f"Torrent candidate ignored: duplicate/lower-priority {child_url}")
                     if len(found) % 10 == 0:
                         print(f"Eligible torrent candidates so far: {len(found)}")
+                if time.time() - last_checkpoint >= 30:
+                    last_checkpoint = time.time()
+                    save_checkpoint()
+    save_checkpoint()
     specs = sorted((spec for _, spec in found.values()), key=lambda spec: torrent_order_key(spec.name, settings.torrent_order))
     print(f"Recursive torrent discovery complete: scanned {len(visited)} directories, found {len(specs)} torrent files.")
     for spec in specs:
@@ -255,7 +294,8 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
 def discover_torrents_indexed(roots: list[tuple[str, str]], settings: TorrentSettings,
                               index_path: str, index_ttl_hours: int,
                               include_mirrors: bool = False,
-                              include_rainbow_tables: bool = False) -> list[TorrentSpec]:
+                              include_rainbow_tables: bool = False,
+                              checkpoint_path: str | None = None) -> list[TorrentSpec]:
     """Reuse the online torrent inventory until its fingerprinted TTL expires."""
     fingerprint = {
         "roots": [list(root) for root in roots],
@@ -276,7 +316,8 @@ def discover_torrents_indexed(roots: list[tuple[str, str]], settings: TorrentSet
 
     specs = discover_torrents_recursive(
         roots, settings, include_mirrors=include_mirrors,
-        include_rainbow_tables=include_rainbow_tables
+        include_rainbow_tables=include_rainbow_tables,
+        checkpoint_path=checkpoint_path,
     )
     os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
     temporary = index_path + ".tmp"
@@ -336,7 +377,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               defcon_only: list[str] | None = None,
               discovery_event: threading.Event | None = None,
               index_path: str | None = None,
-              index_ttl_hours: int = 168) -> int:
+              index_ttl_hours: int = 168,
+              checkpoint_path: str | None = None) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
@@ -347,6 +389,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
         index_ttl_hours,
         include_mirrors=include_mirrors,
         include_rainbow_tables=include_rainbow_tables,
+        checkpoint_path=checkpoint_path,
     )
     if only:
         filters = [f.lower() for f in only]
@@ -521,6 +564,10 @@ def main() -> int:
                         help="Persistent online torrent inventory index path")
     parser.add_argument("--torrent-index-ttl-hours", type=int, default=168,
                         help="Hours before the online torrent inventory is rescanned (default: 168 / 7 days)")
+    parser.add_argument("--torrent-discovery-checkpoint", default=os.environ.get(
+        "INFOCON_TORRENT_DISCOVERY_CHECKPOINT",
+        os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-discovery-checkpoint.json")),
+                        help="Resumable recursive discovery checkpoint path")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated substrings to skip, useful for archives arriving separately")
     parser.add_argument("--torrents-dir", default=DEFAULT_TORRENTS_CACHE,
@@ -582,7 +629,8 @@ def main() -> int:
                      include_rainbow_tables=args.include_rainbow_tables,
                      defcon_only=defcon_only,
                      index_path=args.torrent_index,
-                     index_ttl_hours=max(0, args.torrent_index_ttl_hours))
+                     index_ttl_hours=max(0, args.torrent_index_ttl_hours),
+                     checkpoint_path=args.torrent_discovery_checkpoint)
 
 
 if __name__ == "__main__":
