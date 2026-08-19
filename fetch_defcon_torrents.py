@@ -218,9 +218,10 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                         continue
                     if not name.lower().endswith(".torrent"):
                         continue
-                    stem = re.sub(r"\s+v\d+\.torrent$", "", name, flags=re.IGNORECASE)
+                    stem = re.sub(r"\.torrent$", "", name, flags=re.IGNORECASE)
+                    stem = re.sub(r"\s+v\d+(?:\s*-\s*infocon\.org)?$", "", stem, flags=re.IGNORECASE)
                     candidate = TorrentSpec(name=stem, url=child_url, save_path=save_path)
-                    version_match = re.search(r"v(\d+)\.torrent$", name, re.IGNORECASE)
+                    version_match = re.search(r"\bv(\d+)\b", name, re.IGNORECASE)
                     version = int(version_match.group(1)) if version_match else 0
                     logical = torrent_logical_name(stem)
                     key = f"defcon/{logical}" if logical.startswith("def con") else f"{save_path}/{logical}".lower()
@@ -265,7 +266,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               stalled_callback: Callable[[TorrentSpec], None] | None = None,
               torrent_roots: list[tuple[str, str]] | None = None,
               include_mirrors: bool = False,
-              defcon_only: list[str] | None = None) -> int:
+              defcon_only: list[str] | None = None,
+              discovery_event: threading.Event | None = None) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
@@ -286,10 +288,15 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
         available = [spec for spec in available if not any(f in spec.name.lower() for f in filters)]
     if not available:
         print("No matching torrents found.")
+        if discovery_event is not None:
+            discovery_event.set()
         return 1
 
     defcon_count = sum(1 for spec in available if re.search(r"\bdef con\b", spec.name, re.IGNORECASE))
     print(f"Found {len(available)} torrents to fetch/verify ({defcon_count} DEF CON, {len(available) - defcon_count} other InfoCon torrents).")
+    if discovery_event is not None:
+        print("Online torrent inventory complete; HTTP may now begin without bypassing discovered torrent coverage.")
+        discovery_event.set()
     # libtorrent auto-manages torrents and by default only actively downloads a
     # few at once (active_downloads=3); the rest sit queued with 0 peers. Raise
     # the limits so the whole set downloads in parallel. max_active <= 0 means
@@ -409,8 +416,8 @@ def main() -> int:
                         help="Comma-separated substrings to skip, useful for archives arriving separately")
     parser.add_argument("--torrents-dir", default=DEFAULT_TORRENTS_CACHE,
                          help=f"Where to cache .torrent files (default: {DEFAULT_TORRENTS_CACHE})")
-    parser.add_argument("--max-active", type=int, default=8,
-                         help="Maximum simultaneous active torrents; 0 means unlimited (default: 8)")
+    parser.add_argument("--max-active", type=int, default=4,
+                         help="Maximum simultaneous active torrents; newest are added first; 0 means unlimited (default: 4)")
     parser.add_argument("--connections", type=int, default=800,
                          help="Global libtorrent connection limit (default: 800)")
     parser.add_argument("--listen-interface", default="0.0.0.0:6881",
