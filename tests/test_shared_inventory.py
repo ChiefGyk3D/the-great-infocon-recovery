@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import os
+import subprocess
 import threading
 import unittest
 from unittest.mock import patch, call
@@ -315,6 +316,26 @@ class TestTorrentDiscoveryRetry(unittest.TestCase):
 
         self.assertEqual(attempts, 2)
         self.assertEqual([spec.name for spec in specs], ["Example"])
+
+
+class TestTorrentCurlText(unittest.TestCase):
+
+    def test_non_utf8_listing_bytes_are_replaced(self):
+        from fetch_defcon_torrents import TorrentSettings, curl_text
+
+        settings = TorrentSettings(
+            max_active=1, connections=1, listen_interface="0.0.0.0:6881",
+            poll_seconds=1, seed_time=0, enable_dht=False, enable_pex=False,
+            enable_lsd=False, request_timeout=30, retries=0, retry_delay=0,
+        )
+        completed = subprocess.CompletedProcess(
+            args=["curl"], returncode=0, stdout=b'<table id="list">\xa0</table>', stderr=b"",
+        )
+
+        with patch("fetch_defcon_torrents.subprocess.run", return_value=completed):
+            html = curl_text("https://infocon.org/example/", settings)
+
+        self.assertIn("\ufffd", html)
 
 
 # ---------------------------------------------------------------------------
