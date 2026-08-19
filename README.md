@@ -242,6 +242,17 @@ python infocon_scraper.py \
 
 The skip list is intentionally explicit so it can be changed each year when a new DEF CON torrent or physical conference delivery becomes available. The standalone torrent helper accepts the equivalent `--skip` option.
 
+If a torrent has finished checking but stays at zero peers and zero download rate, combined mode pauses it and hands that archive's media folder back to HTTP after 30 minutes by default. Tune the fallback window when needed:
+
+```bash
+python infocon_scraper.py \
+  --dest "/path/to/InfoCon drive" \
+  --with-torrents \
+  --torrent-stalled-minutes 15
+```
+
+This fallback only applies to torrents that are actually stalled; active torrents and completed torrents remain torrent-authoritative. A standalone `fetch_defcon_torrents.py` run has no HTTP fallback and will continue waiting for its torrent set.
+
 DEF CON 34 may not have a torrent yet. Run the HTTP scraper for that year and any special folders not represented by torrents.
 
 > The `infocon_scraper.py --fetch-torrent` option shells out to `aria2c`, which only supports BitTorrent v1. DEF CON's per-archive torrents on `media.defcon.org` are v2, so use `fetch_defcon_torrents.py` (libtorrent) for those.

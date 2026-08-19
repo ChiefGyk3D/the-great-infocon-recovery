@@ -56,6 +56,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Callable
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -668,7 +669,8 @@ def discover_cons_folders(root_url: str) -> list[str]:
 
 def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argparse.Namespace,
                             ready_event: threading.Event | None = None,
-                            skip: list[str] | None = None) -> int:
+                            skip: list[str] | None = None,
+                            stalled_callback: Callable[[str], None] | None = None) -> int:
     """Run the DEF CON torrent fetcher in-process so the single-entry workflow remains simple."""
     try:
         from fetch_defcon_torrents import TorrentSettings, fetch_all
@@ -689,11 +691,13 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
         request_timeout=120,
         retries=3,
         retry_delay=3,
+        stalled_minutes=args.torrent_stalled_minutes,
     )
     log.info("Running DEF CON torrent phase into %s ...", torrent_dest)
     return fetch_all(dest=torrent_dest,
                      torrents_dir=os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrents"),
-                     only=only, settings=settings, ready_event=ready_event, skip=skip)
+                     only=only, settings=settings, ready_event=ready_event, skip=skip,
+                     stalled_callback=stalled_callback)
 
 
 def build_infocon_roots(root_url: str, only_cons: list[str] | None,
@@ -802,6 +806,11 @@ def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None,
     ]
     names.sort(key=lambda n: (conf_priority_rank(n), n.lower()))
     return [(urljoin(root_url, f"{quote(n)}/"), f"cons/DEF CON/{n}") for n in names]
+
+
+def build_defcon_media_fallback_root(root_url: str, name: str) -> tuple[str, str]:
+    """Build the single HTTP root used when a torrent is proven stalled."""
+    return urljoin(root_url, f"{quote(name)}/"), f"cons/DEF CON/{name}"
 
 
 def build_roots(sources: list[str], infocon_root: str, defcon_media_root: str, defcon_media_skip: set[str] | None,
@@ -925,6 +934,8 @@ def main() -> int:
                          help="If --with-torrents is set, progress refresh interval in seconds (default: 10)")
     parser.add_argument("--torrent-seed-time", type=int, default=0,
                          help="If --with-torrents is set, minutes to seed after completion (default: 0)")
+    parser.add_argument("--torrent-stalled-minutes", type=int, default=30,
+                         help="If --with-torrents is set, hand zero-peer/zero-rate torrents to HTTP after this many minutes (default: 30)")
     parser.add_argument("--manifest", default=None, help="Path to manifest JSON (default: <dest>/.infocon_manifest.json)")
     parser.add_argument("--log-file", default=None, help="Path to log file (default: <dest>/infocon_scraper.log)")
     parser.add_argument("--list-torrents", metavar="NAME",
@@ -1019,14 +1030,38 @@ def main() -> int:
 
     try:
         counts: dict[str, int] = {}
+        fallback_threads: list[threading.Thread] = []
+        fallback_counts: dict[str, int] = {}
+        fallback_counts_lock = threading.Lock()
         if args.with_torrents:
             torrent_only = only_cons or None
             torrent_ready = threading.Event()
 
+            def run_stalled_http_fallback(name: str) -> None:
+                root = build_defcon_media_fallback_root(args.defcon_media_url, name)
+                log.warning("Torrent %s is stalled; starting HTTP fallback for %s", name, root[1])
+                result = run_sync(
+                    [root], args.dest, manifest, args.crawl_workers, args.workers,
+                    args.verify_all, args.dry_run, stop_requested, [],
+                    args.max_pending_downloads, stats, skip_paths=skip_recent
+                )
+                with fallback_counts_lock:
+                    for key, value in result.items():
+                        fallback_counts[key] = fallback_counts.get(key, 0) + value
+
+            def start_stalled_http_fallback(name: str) -> None:
+                thread = threading.Thread(
+                    target=run_stalled_http_fallback, args=(name,),
+                    name=f"http-fallback-{name}", daemon=False
+                )
+                fallback_threads.append(thread)
+                thread.start()
+
             def run_torrent_phase() -> None:
                 try:
                     torrent_result[0] = run_defcon_torrent_step(
-                        args.dest, torrent_only, args, ready_event=torrent_ready, skip=skip_recent
+                        args.dest, torrent_only, args, ready_event=torrent_ready, skip=skip_recent,
+                        stalled_callback=start_stalled_http_fallback
                     )
                 except Exception:
                     log.exception("DEF CON torrent phase failed unexpectedly.")
@@ -1065,12 +1100,16 @@ def main() -> int:
     finally:
         if torrent_thread:
             torrent_thread.join()
+        for fallback_thread in fallback_threads:
+            fallback_thread.join()
         if reporter:
             reporter.stop()
             reporter.join(timeout=args.status_interval + 2)
         manifest.save()
         release_lock(lock_path)
 
+    for key, value in fallback_counts.items():
+        counts[key] = counts.get(key, 0) + value
     final = stats.snapshot()
     elapsed = time.time() - stats.start
     avg_rate = final["downloaded_bytes"] / elapsed if elapsed > 0 else 0.0

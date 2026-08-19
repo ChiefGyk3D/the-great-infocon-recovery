@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import libtorrent as lt
 
@@ -98,6 +99,7 @@ class TorrentSettings:
     request_timeout: int
     retries: int
     retry_delay: int
+    stalled_minutes: int = 30
 
 
 def build_libtorrent_session(settings: TorrentSettings) -> lt.session:
@@ -177,7 +179,8 @@ def torrent_priority(name: str) -> tuple[int, int, str]:
 
 def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               settings: TorrentSettings, ready_event: threading.Event | None = None,
-              skip: list[str] | None = None) -> int:
+              skip: list[str] | None = None,
+              stalled_callback: Callable[[str], None] | None = None) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
@@ -202,6 +205,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     ses = build_libtorrent_session(settings)
     handles = {}
     completed_at: dict[str, float] = {}
+    no_activity_since: dict[str, float] = {}
+    stalled_names: set[str] = set()
 
     for name, href in sorted(available.items(), key=lambda item: torrent_priority(item[0])):
         torrent_url = TORRENTS_DIR_URL + href
@@ -229,6 +234,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
             active = []
             checking = False
             for name, h in handles.items():
+                if name in stalled_names:
+                    continue
                 s = h.status()
                 if s.state in (
                     lt.torrent_status.queued_for_checking,
@@ -248,6 +255,18 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                     elif settings.seed_time > 0 and time.time() - completed_at[name] >= settings.seed_time * 60:
                         h.pause()
                 else:
+                    if checking_complete and stalled_callback is not None:
+                        if s.num_peers == 0 and s.download_rate == 0:
+                            no_activity_since.setdefault(name, time.time())
+                            quiet_for = time.time() - no_activity_since[name]
+                            if quiet_for >= settings.stalled_minutes * 60:
+                                stalled_names.add(name)
+                                h.pause()
+                                print(f"Stalled after {quiet_for / 60:.0f} minutes; handing {name} back to HTTP.")
+                                stalled_callback(name)
+                                continue
+                        else:
+                            no_activity_since.pop(name, None)
                     active.append((s.download_rate, s.progress, s.num_peers, str(s.state), name))
             # Highest download rate first; ties break newest-DEF-CON-first instead of
             # alphabetically (plain string sort would put "DEF CON 2" ahead of "19").
@@ -263,7 +282,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                 checking_complete = True
                 print("Initial torrent file checking complete; HTTP sync may proceed in parallel.")
                 ready_event.set()
-            if done == len(handles):
+            target_count = len(handles) - len(stalled_names)
+            if done == target_count:
                 print("All requested DEF CON items fully downloaded and verified.")
                 break
             time.sleep(settings.poll_seconds)
@@ -298,6 +318,8 @@ def main() -> int:
                          help="Progress reporting interval (default: 10)")
     parser.add_argument("--seed-time", type=int, default=0,
                          help="Minutes to seed after completion; 0 disables seeding")
+    parser.add_argument("--stalled-minutes", type=int, default=30,
+                        help="Minutes with zero peers and zero download rate before combined mode hands an item to HTTP (default: 30)")
     parser.add_argument("--no-dht", action="store_true", help="Disable the distributed hash table")
     parser.add_argument("--no-pex", action="store_true", help="Disable peer exchange")
     parser.add_argument("--no-lsd", action="store_true", help="Disable local peer discovery")
@@ -328,6 +350,7 @@ def main() -> int:
         request_timeout=max(1, args.request_timeout),
         retries=max(0, args.retries),
         retry_delay=max(0, args.retry_delay),
+        stalled_minutes=max(1, args.stalled_minutes),
     )
     return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip)
 
