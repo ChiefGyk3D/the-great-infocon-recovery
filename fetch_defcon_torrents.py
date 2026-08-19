@@ -367,6 +367,52 @@ def torrent_source_priority(spec: TorrentSpec) -> int:
     return 2
 
 
+def _merge_infocon_candidates(
+    available: list[TorrentSpec],
+    infocon_candidates: list[dict],
+) -> list[TorrentSpec]:
+    """Merge raw infocon.org torrent candidates from scan_infocon_tree into
+    an existing TorrentSpec list discovered from other roots (e.g. media.defcon.org).
+
+    Candidates whose logical name already appears in *available* are dropped so
+    the media.defcon.org entry always wins.  Within the new candidates the
+    highest version wins.  *available* is returned extended in-place.
+    """
+    # Logical keys already covered by the media.defcon.org scan
+    covered: set[str] = set()
+    for spec in available:
+        logical = torrent_logical_name(spec.name)
+        key = (f"defcon/{logical}" if logical.startswith("def con")
+               else f"{spec.save_path}/{logical}".lower())
+        covered.add(key)
+
+    # Pick best version for each logical name within the infocon.org candidates
+    best: dict[str, tuple[int, dict]] = {}
+    for cand in infocon_candidates:
+        raw_name = cand.get("name", "")
+        if not raw_name.lower().endswith(".torrent"):
+            continue
+        vm = re.search(r"\bv(\d+)\b", raw_name, re.IGNORECASE)
+        version = int(vm.group(1)) if vm else 0
+        stem = re.sub(r"\.torrent$", "", raw_name, flags=re.IGNORECASE)
+        stem = re.sub(r"\s+v\d+(?:\s*-\s*infocon\.org)?$", "", stem, flags=re.IGNORECASE).strip()
+        logical = torrent_logical_name(stem)
+        save_path = cand.get("save_path", "")
+        key = (f"defcon/{logical}" if logical.startswith("def con")
+               else f"{save_path}/{logical}".lower())
+        if key in covered:
+            continue
+        prev = best.get(key)
+        if prev is None or version > prev[0]:
+            best[key] = (version, {"stem": stem, "url": cand["url"], "save_path": save_path})
+
+    for key, (_, info) in best.items():
+        available.append(TorrentSpec(name=info["stem"], url=info["url"], save_path=info["save_path"]))
+        covered.add(key)
+
+    return available
+
+
 def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               settings: TorrentSettings, ready_event: threading.Event | None = None,
               skip: list[str] | None = None,
@@ -378,19 +424,47 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               discovery_event: threading.Event | None = None,
               index_path: str | None = None,
               index_ttl_hours: int = 168,
-              checkpoint_path: str | None = None) -> int:
+              checkpoint_path: str | None = None,
+              infocon_candidates: list[dict] | None = None) -> int:
+    """Discover and download torrents.
+
+    When *infocon_candidates* is supplied (from scan_infocon_tree in
+    infocon_scraper.py), the infocon.org root is excluded from the network
+    discovery so only media.defcon.org/DEF CON Torrents/ is scanned; the
+    pre-discovered infocon.org torrent entries are merged in afterwards.  This
+    eliminates the duplicate infocon.org directory traversal.
+    """
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
     roots = torrent_roots or [(TORRENTS_DIR_URL, dest)]
+
+    if infocon_candidates is not None:
+        # infocon.org already traversed by the shared scan; only hit media.defcon.org
+        effective_roots = [(url, sp) for url, sp in roots if "infocon.org" not in url.lower()]
+        # If no non-infocon root remains, fall back to the full list so at least
+        # media.defcon.org is always queried for authoritative DEF CON torrents.
+        if not effective_roots:
+            effective_roots = roots
+        # Checkpointing covers the full infocon.org tree, which is now external;
+        # skip it for the media.defcon.org-only scan to avoid a stale-fingerprint hit.
+        effective_checkpoint = None
+    else:
+        effective_roots = roots
+        effective_checkpoint = checkpoint_path
+
     available = discover_torrents_indexed(
-        roots, settings,
+        effective_roots, settings,
         index_path or os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-index.json"),
         index_ttl_hours,
         include_mirrors=include_mirrors,
         include_rainbow_tables=include_rainbow_tables,
-        checkpoint_path=checkpoint_path,
+        checkpoint_path=effective_checkpoint,
     )
+
+    if infocon_candidates is not None:
+        available = _merge_infocon_candidates(available, infocon_candidates)
+
     if only:
         filters = [f.lower() for f in only]
         available = [spec for spec in available if any(f in spec.name.lower() for f in filters)]

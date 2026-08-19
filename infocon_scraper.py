@@ -460,7 +460,8 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
              initial_files: list[RemoteFile] | None = None,
              max_pending_downloads: int | None = None,
              stats: "ProgressStats | None" = None,
-             skip_paths: list[str] | None = None) -> dict[str, int]:
+             skip_paths: list[str] | None = None,
+             initial_files_already_counted: bool = False) -> dict[str, int]:
     """Crawl and download at the same time: as soon as a file is discovered it's
     handed to the download pool immediately, instead of waiting for the entire
     site to be crawled first. This is what lets priority roots (DEF CON,
@@ -472,7 +473,7 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
     discovered = 0
     completed = 0
     ready_files = deque(initial_files or [])
-    if initial_files and stats:
+    if initial_files and stats and not initial_files_already_counted:
         stats.add_discovered(len(initial_files))
     discovered += len(initial_files or [])
     pending_downloads = 0
@@ -695,8 +696,14 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
                             ready_event: threading.Event | None = None,
                             skip: list[str] | None = None,
                             stalled_callback: Callable[[str], None] | None = None,
-                            discovery_event: threading.Event | None = None) -> int:
-    """Run the DEF CON torrent fetcher in-process so the single-entry workflow remains simple."""
+                            discovery_event: threading.Event | None = None,
+                            infocon_candidates: list[dict] | None = None) -> int:
+    """Run the DEF CON torrent fetcher in-process so the single-entry workflow remains simple.
+
+    When *infocon_candidates* is provided (from scan_infocon_tree), the torrent
+    helper skips its own infocon.org traversal and merges these pre-discovered
+    candidates instead, eliminating the duplicate directory scan.
+    """
     try:
         from fetch_defcon_torrents import TorrentSettings, fetch_all
     except Exception as exc:  # pragma: no cover - depends on optional libtorrent install
@@ -735,6 +742,7 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
                      include_rainbow_tables=args.torrent_include_rainbow_tables,
                      defcon_only=defcon_only,
                      discovery_event=discovery_event,
+                     infocon_candidates=infocon_candidates,
                      index_path=args.torrent_index or os.path.join(
                          os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-index.json"
                      ),
@@ -862,6 +870,89 @@ def build_defcon_media_roots(root_url: str, skip_names: set[str] | None = None,
 def build_defcon_media_fallback_root(root_url: str, name: str) -> tuple[str, str]:
     """Build the single HTTP root used when a torrent is proven stalled."""
     return urljoin(root_url, f"{quote(name)}/"), f"cons/DEF CON/{name}"
+
+
+def scan_infocon_tree(
+    http_roots: list[tuple[str, str]],
+    extra_torrent_roots: list[tuple[str, str]],
+    crawl_workers: int,
+    dest_root: str,
+    stop_requested: threading.Event | None = None,
+    stats: "ProgressStats | None" = None,
+) -> tuple[list[RemoteFile], list[dict]]:
+    """Single-pass recursive scan over infocon.org roots.
+
+    Crawls *http_roots* for both HTTP-downloadable files and .torrent metadata,
+    and *extra_torrent_roots* for .torrent metadata only (those paths are served
+    via a different HTTP source, e.g. media.defcon.org).  Returns
+    *(http_files, torrent_candidates)* so that --with-torrents mode can feed
+    both the BitTorrent engine and the HTTP sync worker pool from one network
+    traversal instead of two separate ones.
+
+    torrent_candidates entries: {"url": str, "name": str, "save_path": str}
+    where save_path is the absolute directory to hand to libtorrent.
+    """
+    http_files: list[RemoteFile] = []
+    torrent_candidates: list[dict] = []
+    directories_scanned = 0
+    listing_errors = 0
+    last_progress = time.time()
+    scan_started = time.time()
+
+    http_url_set = {url for url, _ in http_roots}
+
+    with ThreadPoolExecutor(max_workers=max(1, crawl_workers)) as pool:
+        # (future) -> (url, rel, is_http_eligible)
+        pending: dict = {}
+        for url, rel in http_roots:
+            pending[pool.submit(list_directory, url)] = (url, rel, True)
+        for url, rel in extra_torrent_roots:
+            if url not in http_url_set:
+                pending[pool.submit(list_directory, url)] = (url, rel, False)
+
+        while pending:
+            if stop_requested and stop_requested.is_set():
+                break
+            done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+            for fut in done:
+                url, rel, is_http = pending.pop(fut)
+                try:
+                    entries = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    listing_errors += 1
+                    log.error("Failed to list %s during shared inventory scan: %s", url, exc)
+                    continue
+                directories_scanned += 1
+                for entry in entries:
+                    child_url = urljoin(url, entry["href"])
+                    child_rel = os.path.join(rel, entry["name"]) if rel else entry["name"]
+                    if entry["is_dir"]:
+                        pending[pool.submit(list_directory, child_url)] = (child_url, child_rel, is_http)
+                    elif entry["name"].lower().endswith(".torrent"):
+                        torrent_candidates.append({
+                            "url": child_url,
+                            "name": entry["name"],
+                            # Absolute directory path libtorrent will use as save_path
+                            "save_path": os.path.join(dest_root, rel),
+                        })
+                    elif is_http:
+                        http_files.append(RemoteFile(url=child_url, rel_path=child_rel))
+                        if stats:
+                            stats.add_discovered()
+                now = time.time()
+                if now - last_progress >= 10:
+                    last_progress = now
+                    log.info(
+                        "Shared inventory progress: %d directories scanned, %d pending, %d HTTP files, %d torrent candidates, %d errors, %s elapsed",
+                        directories_scanned, len(pending), len(http_files), len(torrent_candidates),
+                        listing_errors, format_duration(now - scan_started),
+                    )
+
+    log.info(
+        "Shared infocon.org scan complete: %d HTTP files, %d torrent candidates across %d root(s).",
+        len(http_files), len(torrent_candidates), len(http_roots) + len(extra_torrent_roots),
+    )
+    return http_files, torrent_candidates
 
 
 def build_roots(sources: list[str], infocon_root: str, defcon_media_root: str, defcon_media_skip: set[str] | None,
@@ -1101,6 +1192,7 @@ def main() -> int:
     if reporter:
         reporter.start()
 
+    inventory_thread: threading.Thread | None = None
     try:
         counts: dict[str, int] = {}
         fallback_threads: list[threading.Thread] = []
@@ -1110,6 +1202,53 @@ def main() -> int:
             torrent_only = only_cons or None
             torrent_ready = threading.Event()
             torrent_discovery = threading.Event()
+
+            # ------------------------------------------------------------------
+            # Shared infocon.org inventory discovers regular HTTP files while the
+            # torrent helper performs its own torrent-first recursive discovery.
+            # Running both traversals concurrently allows torrent metadata and
+            # downloads to start without waiting for the HTTP inventory.
+            #
+            # extra_torrent_roots covers infocon.org paths that are not in
+            # non_defcon_roots (those go via media.defcon.org for HTTP) but do
+            # publish .torrent files that belong in the torrent inventory.
+            # ------------------------------------------------------------------
+            extra_torrent_roots: list[tuple[str, str]] = []
+            if "infocon" in sources:
+                # cons/DEF CON/ on infocon.org has .torrent files; not in HTTP roots
+                # (media.defcon.org is the authoritative HTTP source for DEF CON)
+                extra_torrent_roots.append((
+                    urljoin(args.base_url, "cons/DEF%20CON/"), "cons/DEF CON"
+                ))
+            if args.torrent_include_mirrors and not any(
+                "mirrors" in rel.lower() for _, rel in non_defcon_roots
+            ):
+                extra_torrent_roots.append((urljoin(args.base_url, "mirrors/"), "mirrors"))
+            if args.torrent_include_rainbow_tables and not any(
+                "rainbow" in rel.lower() for _, rel in non_defcon_roots
+            ):
+                extra_torrent_roots.append((
+                    urljoin(args.base_url, quote("rainbow tables") + "/"), "rainbow tables"
+                ))
+
+            log.info(
+                "Running shared infocon.org directory inventory: %d HTTP roots, %d torrent-only roots ...",
+                len(non_defcon_roots), len(extra_torrent_roots),
+            )
+            shared_http_files: list[RemoteFile] = []
+            shared_inventory_ready = threading.Event()
+
+            def run_shared_inventory() -> None:
+                try:
+                    files, _ = scan_infocon_tree(
+                        non_defcon_roots, extra_torrent_roots,
+                        args.crawl_workers, args.dest, stop_requested, stats,
+                    )
+                    shared_http_files.extend(files)
+                except Exception:
+                    log.exception("Shared infocon.org inventory failed unexpectedly.")
+                finally:
+                    shared_inventory_ready.set()
 
             def run_stalled_http_fallback(spec) -> None:
                 fallback_url = urljoin(spec.url, "./")
@@ -1138,7 +1277,7 @@ def main() -> int:
                     torrent_result[0] = run_defcon_torrent_step(
                         args.dest, torrent_only, args, ready_event=torrent_ready, skip=skip_recent,
                         stalled_callback=start_stalled_http_fallback,
-                        discovery_event=torrent_discovery
+                        discovery_event=torrent_discovery,
                     )
                 except Exception:
                     log.exception("DEF CON torrent phase failed unexpectedly.")
@@ -1151,14 +1290,22 @@ def main() -> int:
                 target=run_torrent_phase, name="defcon-torrents", daemon=False
             )
             torrent_thread.start()
-            log.info("Waiting for the complete online torrent inventory before starting HTTP ...")
+            inventory_thread = threading.Thread(
+                target=run_shared_inventory, name="shared-infocon-inventory", daemon=False
+            )
+            inventory_thread.start()
+            log.info("Torrent discovery and shared HTTP inventory are running in parallel ...")
             torrent_discovery.wait()
-            if non_defcon_roots:
-                log.info("Online torrent inventory complete; crawling non-DEF CON content ...")
+            log.info("Online torrent inventory complete; waiting for shared HTTP inventory ...")
+            shared_inventory_ready.wait()
+            if shared_http_files or non_defcon_roots:
+                log.info("Online torrent inventory complete; starting non-DEF CON HTTP sync ...")
+                # non_defcon_roots already inventoried by shared scan; pass as initial_files
+                # so run_sync downloads immediately without a second crawl pass.
                 for key, value in run_sync(
-                    non_defcon_roots, args.dest, manifest, args.crawl_workers, args.workers,
-                    args.verify_all, args.dry_run, stop_requested, initial_files,
-                    args.max_pending_downloads, stats
+                    [], args.dest, manifest, args.crawl_workers, args.workers,
+                    args.verify_all, args.dry_run, stop_requested, shared_http_files,
+                    args.max_pending_downloads, stats, initial_files_already_counted=True
                 ).items():
                     counts[key] = counts.get(key, 0) + value
             log.info("Waiting for initial DEF CON torrent file checking before crawling DEF CON HTTP remainder ...")
@@ -1178,6 +1325,8 @@ def main() -> int:
                               args.verify_all, args.dry_run, stop_requested, initial_files,
                               args.max_pending_downloads, stats)
     finally:
+        if inventory_thread:
+            inventory_thread.join()
         if torrent_thread:
             torrent_thread.join()
         for fallback_thread in fallback_threads:

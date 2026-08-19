@@ -11,7 +11,15 @@ while :; do
     if [[ -n "$latest" ]]; then
         printf '%s\n' "$latest"
     else
-        printf 'HTTP progress has not emitted a status line yet.\n'
+        printf 'HTTP transfer progress has not emitted a status line yet.\n'
+    fi
+
+    printf '\nShared inventory:\n'
+    latest_inventory=$(grep -E 'Running shared infocon.org directory inventory:|Shared inventory progress:|Shared infocon.org scan complete:' "$LOG" 2>/dev/null | tail -n 1 || true)
+    if [[ -n "$latest_inventory" ]]; then
+        printf '%s\n' "$latest_inventory"
+    else
+        printf 'Shared inventory has not emitted a status line yet.\n'
     fi
 
     printf '\nHTTP staging:\n'
