@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -247,6 +248,45 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
     return specs
 
 
+def discover_torrents_indexed(roots: list[tuple[str, str]], settings: TorrentSettings,
+                              index_path: str, index_ttl_hours: int,
+                              include_mirrors: bool = False,
+                              include_rainbow_tables: bool = False) -> list[TorrentSpec]:
+    """Reuse the online torrent inventory until its fingerprinted TTL expires."""
+    fingerprint = {
+        "roots": [list(root) for root in roots],
+        "include_mirrors": include_mirrors,
+        "include_rainbow_tables": include_rainbow_tables,
+    }
+    try:
+        with open(index_path, "r", encoding="utf-8") as stream:
+            cached = json.load(stream)
+        age_hours = (time.time() - float(cached["scanned_at"])) / 3600
+        if age_hours <= index_ttl_hours and cached.get("fingerprint") == fingerprint:
+            specs = [TorrentSpec(**item) for item in cached["torrents"]]
+            print(f"Loaded torrent inventory index: {len(specs)} entries, age {age_hours:.1f} hours.")
+            return specs
+        print(f"Torrent inventory index expired or changed; rescanning online (age {age_hours:.1f} hours).")
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
+        print("No usable torrent inventory index; scanning the online tree.")
+
+    specs = discover_torrents_recursive(
+        roots, settings, include_mirrors=include_mirrors,
+        include_rainbow_tables=include_rainbow_tables
+    )
+    os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
+    temporary = index_path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump({
+            "scanned_at": time.time(),
+            "fingerprint": fingerprint,
+            "torrents": [spec.__dict__ for spec in specs],
+        }, stream, indent=2, sort_keys=True)
+    os.replace(temporary, index_path)
+    print(f"Saved torrent inventory index: {len(specs)} entries at {index_path}.")
+    return specs
+
+
 def torrent_priority(name: str) -> tuple[int, int, str]:
     """Sort numbered DEF CON archives newest first, then non-numbered items."""
     match = re.search(r"\b(?:DEF CON|DC)\s+(\d+)\b", name, re.IGNORECASE)
@@ -281,14 +321,19 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               include_mirrors: bool = False,
               include_rainbow_tables: bool = False,
               defcon_only: list[str] | None = None,
-              discovery_event: threading.Event | None = None) -> int:
+              discovery_event: threading.Event | None = None,
+              index_path: str | None = None,
+              index_ttl_hours: int = 168) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
     roots = torrent_roots or [(TORRENTS_DIR_URL, dest)]
-    available = discover_torrents_recursive(
-        roots, settings, include_mirrors=include_mirrors,
-        include_rainbow_tables=include_rainbow_tables
+    available = discover_torrents_indexed(
+        roots, settings,
+        index_path or os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-index.json"),
+        index_ttl_hours,
+        include_mirrors=include_mirrors,
+        include_rainbow_tables=include_rainbow_tables,
     )
     if only:
         filters = [f.lower() for f in only]
@@ -431,6 +476,12 @@ def main() -> int:
                         help="Recursively search infocon.org/rainbow tables too; disabled by default because it is multi-terabyte")
     parser.add_argument("--discovery-workers", type=int, default=8,
                         help="Concurrent recursive torrent listing workers (default: 8)")
+    parser.add_argument("--torrent-index", default=os.environ.get(
+        "INFOCON_TORRENT_INDEX",
+        os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-index.json")),
+                        help="Persistent online torrent inventory index path")
+    parser.add_argument("--torrent-index-ttl-hours", type=int, default=168,
+                        help="Hours before the online torrent inventory is rescanned (default: 168 / 7 days)")
     parser.add_argument("--skip", default=None,
                         help="Comma-separated substrings to skip, useful for archives arriving separately")
     parser.add_argument("--torrents-dir", default=DEFAULT_TORRENTS_CACHE,
@@ -484,7 +535,9 @@ def main() -> int:
     return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip,
                      include_mirrors=args.include_mirrors,
                      include_rainbow_tables=args.include_rainbow_tables,
-                     defcon_only=defcon_only)
+                     defcon_only=defcon_only,
+                     index_path=args.torrent_index,
+                     index_ttl_hours=max(0, args.torrent_index_ttl_hours))
 
 
 if __name__ == "__main__":

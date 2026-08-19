@@ -128,19 +128,19 @@ The destination may be completely empty. The online InfoCon and media sources ar
 Use the single friendly entrypoint for normal users:
 
 ```bash
-./.venv/bin/python infocon.py
+./.venv/bin/python bin/infocon.py
 ```
 
 It opens a numbered wizard for destination, refresh scope, HTTP workers, torrent scope, stalled-torrent fallback, and Rainbow Tables confirmation. For repeat runs, copy `.env.example` to `.env`, edit it once, then use:
 
 ```bash
-./.venv/bin/python infocon.py --repeat
+./.venv/bin/python bin/infocon.py --repeat
 ```
 
 Advanced users can bypass the wizard and use the full scraper CLI:
 
 ```bash
-./.venv/bin/python infocon.py --advanced --dest "/path/to/drive" --with-torrents
+./.venv/bin/python bin/infocon.py --advanced --dest "/path/to/drive" --with-torrents
 ```
 
 Rainbow Tables remain excluded unless explicitly enabled in the wizard or `.env`.
@@ -322,7 +322,7 @@ df -h "/path/to/drive"
 For a detached overview with mount health, free-space/inode alerts, torrent cache size, worker CPU/memory/threads/fds/disk I/O, and recent errors:
 
 ```bash
-nohup ./monitor_infocon.sh > monitor-daemon.log 2>&1 &
+nohup ./monitoring/monitor_infocon.sh > monitor-daemon.log 2>&1 &
 tail -f infocon-monitor.out
 ```
 
@@ -331,8 +331,8 @@ The overview defaults to `/media/chiefgyk3d/infocon.org DC30`. Override it with 
 For a persistent detachable six-pane dashboard, start it once with the setup script, which creates the tmux session and starts the overview daemon above if it isn't already running:
 
 ```bash
-./start-dashboard.sh
-./tmux-infocon.sh attach -t infocon-monitor
+./bin/start-dashboard.sh
+./bin/tmux-infocon.sh attach -t infocon-monitor
 ```
 
 The panes are:
@@ -346,7 +346,7 @@ The panes are:
 | HTTP status | `monitor_http_status.sh` | Live progress bar, discovered/downloaded/skipped/error counts, `.part` staging probe, recent HTTP failures |
 | BitTorrent status | `monitor_torrent_status.sh` | Active downloads always shown in full; checking/queued torrents truncated with a remaining count; state-count summary |
 
-The overview pane just tails a snapshot file (`infocon-monitor.out`) written by the separate `monitor_infocon.sh` daemon, so that daemon must be running for the overview pane to show live data; `start-dashboard.sh` starts it automatically if it isn't already. The network and disk panes default to `eno1` and `sdc`; `start-dashboard.sh` reads `INFOCON_NETWORK_INTERFACE` and `INFOCON_DISK_DEVICE` and passes them through. Running `monitor_network_io.sh` or `monitor_disk_io.sh` directly instead takes the interface/device as a positional argument, e.g. `./monitor_disk_io.sh nvme0n1 10`. The torrent pane truncates checking/queued entries at `INFOCON_TORRENT_MAX_IDLE_LINES` (default 10). Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with `./tmux-infocon.sh attach -t infocon-monitor`, list sessions with `./tmux-infocon.sh ls`, and stop only the dashboard with `./tmux-infocon.sh kill-session -t infocon-monitor`.
+The overview pane just tails a snapshot file (`infocon-monitor.out`) written by the separate `monitoring/monitor_infocon.sh` daemon, so that daemon must be running for the overview pane to show live data; `bin/start-dashboard.sh` starts it automatically if it isn't already. The network and disk panes default to `eno1` and `sdc`; `bin/start-dashboard.sh` reads `INFOCON_NETWORK_INTERFACE` and `INFOCON_DISK_DEVICE` and passes them through. Running `monitoring/monitor_network_io.sh` or `monitoring/monitor_disk_io.sh` directly instead takes the interface/device as a positional argument, e.g. `./monitoring/monitor_disk_io.sh nvme0n1 10`. The torrent pane truncates checking/queued entries at `INFOCON_TORRENT_MAX_IDLE_LINES` (default 10). Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with `./bin/tmux-infocon.sh attach -t infocon-monitor`, list sessions with `./bin/tmux-infocon.sh ls`, and stop only the dashboard with `./bin/tmux-infocon.sh kill-session -t infocon-monitor`.
 
 The HTTP manifest is stored at `<destination>/.infocon_manifest.json` by default. Logs can be placed elsewhere with `--log-file`.
 

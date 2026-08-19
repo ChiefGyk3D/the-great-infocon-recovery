@@ -728,7 +728,9 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
                      include_mirrors=args.torrent_include_mirrors,
                      include_rainbow_tables=args.torrent_include_rainbow_tables,
                      defcon_only=defcon_only,
-                     discovery_event=discovery_event)
+                     discovery_event=discovery_event,
+                     index_path=args.torrent_index,
+                     index_ttl_hours=max(0, args.torrent_index_ttl_hours))
 
 
 def build_infocon_roots(root_url: str, only_cons: list[str] | None,
@@ -984,6 +986,10 @@ def main() -> int:
                          help="Recursively include infocon.org/rainbow tables torrents; disabled by default")
     parser.add_argument("--torrent-discovery-workers", type=int, default=8,
                          help="Concurrent recursive torrent listing workers (default: 8)")
+    parser.add_argument("--torrent-index", default=None,
+                         help="Persistent online torrent inventory index path (default: ~/.cache/infocon-scraper/torrent-index.json)")
+    parser.add_argument("--torrent-index-ttl-hours", type=int, default=168,
+                         help="Hours before online torrent inventory is rescanned (default: 168 / 7 days)")
     parser.add_argument("--manifest", default=None, help="Path to manifest JSON (default: <dest>/.infocon_manifest.json)")
     parser.add_argument("--log-file", default=None, help="Path to log file (default: <dest>/infocon_scraper.log)")
     parser.add_argument("--list-torrents", metavar="NAME",
