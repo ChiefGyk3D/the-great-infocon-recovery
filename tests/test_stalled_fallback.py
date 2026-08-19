@@ -255,7 +255,7 @@ class TestPathClaims(unittest.TestCase):
         results: list[str] = []
         results_lock = threading.Lock()
 
-        def fake_download(url, local_path, remote_size):
+        def fake_download(url, local_path, expected_size, slack=0):
             with downloads_lock:
                 downloads.append(local_path)
             started.wait()

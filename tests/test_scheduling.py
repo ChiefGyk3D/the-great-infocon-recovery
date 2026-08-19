@@ -147,18 +147,44 @@ class TestManifestFastPath(RunConfigGuard):
                                                   verify_all=False, dry_run=False)
         self.assertEqual(result, "skip-known-good")
 
-    def test_verify_all_still_forces_the_network_check(self):
+    def test_verify_all_still_rehashes_instead_of_trusting_the_manifest(self):
         manifest = Manifest(":memory:")
         manifest.set("cons/x.pdf", {"size": 1000, "mtime": 1_700_000_000.0, "sha256": "abc"})
-        with patch("infocon_scraper.curl_head_size", return_value=1000) as head, \
+        with patch("infocon_scraper.os.path.exists", return_value=True), \
+                patch("infocon_scraper.os.path.getsize", return_value=1000), \
+                patch("infocon_scraper.sha256_file", return_value="abc") as hashed, \
+                patch("infocon_scraper.is_unpacked_archive_duplicate", return_value=False):
+            result, _ = infocon_scraper.sync_file(self.item(), "/mnt/archive", manifest,
+                                                  verify_all=True, dry_run=False)
+        hashed.assert_called_once()
+        self.assertEqual(result, "skip-verified")
+
+    def test_listing_size_removes_the_head_request(self):
+        """Neither archive host returns Content-Length, so the HEAD bought nothing."""
+        manifest = Manifest(":memory:")
+        with patch("infocon_scraper.curl_head_size",
+                   side_effect=AssertionError("HEAD issued")), \
                 patch("infocon_scraper.os.path.exists", return_value=True), \
                 patch("infocon_scraper.os.path.getsize", return_value=1000), \
                 patch("infocon_scraper.sha256_file", return_value="abc"), \
                 patch("infocon_scraper.is_unpacked_archive_duplicate", return_value=False):
             result, _ = infocon_scraper.sync_file(self.item(), "/mnt/archive", manifest,
-                                                  verify_all=True, dry_run=False)
+                                                  verify_all=False, dry_run=False)
+        self.assertEqual(result, "baseline-recorded")
+
+    def test_head_is_still_used_when_the_listing_omits_a_size(self):
+        manifest = Manifest(":memory:")
+        item = RemoteFile(url="https://example.com/x.pdf", rel_path="x.pdf",
+                          modified=0.0, size=None)
+        with patch("infocon_scraper.curl_head_size", return_value=1000) as head, \
+                patch("infocon_scraper.os.path.exists", return_value=True), \
+                patch("infocon_scraper.os.path.getsize", return_value=1000), \
+                patch("infocon_scraper.sha256_file", return_value="abc"), \
+                patch("infocon_scraper.is_unpacked_archive_duplicate", return_value=False):
+            result, _ = infocon_scraper.sync_file(item, "/mnt/archive", manifest,
+                                                  verify_all=False, dry_run=False)
         head.assert_called_once()
-        self.assertEqual(result, "skip-verified")
+        self.assertEqual(result, "baseline-recorded")
 
 
 # ---------------------------------------------------------------------------

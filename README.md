@@ -166,7 +166,7 @@ Run the same command again later to refresh the drive. The online directory list
 
 Content discovery defaults to newest-first using the online directory modification metadata, including nested directories. Torrent scheduling also defaults to newest-first. Select `--content-order oldest --torrent-order oldest` for a deliberate historical backfill; the wizard and `.env` expose the same choice.
 
-Listings also publish a rounded file size, which the scraper reads for scheduling and free-space decisions. It is a hint only: verification always uses the exact `Content-Length`.
+Listings also publish a rounded file size. Because neither host sends `Content-Length`, this is the only size available before a transfer, and the scraper uses it for scheduling, free-space checks, skip decisions, and post-download verification - always compared within the slack implied by how precisely it was printed.
 
 Useful options:
 
@@ -391,14 +391,16 @@ The HTTP manifest is a SQLite database at `<destination>/.infocon_manifest.db` b
 
 The HTTP sync is built to survive interruptions and large runs:
 
-- **Atomic writes.** Each file downloads to a `.part` sibling and is renamed into place only after its size matches the server's `Content-Length`. A killed or truncated transfer never leaves a file that looks complete.
-- **Per-file retries.** Failed or size-mismatched downloads retry with backoff (`--retries`, default 4). Partial `.part` files resume when the server supports ranges.
+- **Atomic writes.** Each file downloads to a `.part` sibling and is renamed into place only once it looks complete, so a killed or truncated transfer never leaves a file that looks whole.
+- **Verification without `Content-Length`.** Neither archive host sends `Content-Length`, so curl's exit status is the primary integrity signal: a truncated response surfaces as a transfer error rather than a short body. The directory listing's published size is the second check, compared within the slack implied by its printed precision - a value shown as `648.6 KiB` is known to about 102 bytes, so a badly short file is still caught.
+- **Per-file retries.** Failed or size-mismatched downloads retry with backoff (`--retries`, default 4).
+- **Resume where it is possible.** Partial `.part` files resume when the host honours `Range`. Neither infocon.org nor media.defcon.org does - both answer a ranged request with the whole body - so transfers there restart if interrupted. That is detected once per host at runtime rather than assumed, and the staged file is discarded instead of retried into a permanent failure.
 - **Stall detection, not wall-clock caps.** A transfer is abandoned only when it averages under `--min-speed-bytes` (default 1024) for `--stall-timeout` seconds (default 300). There is no hard per-attempt time limit by default, because the largest word lists need many hours and an aborted attempt restarts from the beginning; set `--download-timeout` if you want one anyway.
 - **One writer per file.** Concurrent HTTP phases can discover the same file; only one worker is ever allowed to stage a given destination path, so two transfers can never share a `.part`.
 - **Bounded memory.** Download scheduling is capped (`--max-pending-downloads`, default `workers * 4`) so very large trees cannot accumulate hundreds of thousands of in-memory tasks.
-- **Disk-space guard.** A download that would leave less than `--min-free-gib` (default 1) free is refused, and a genuinely full destination halts the run cleanly instead of writing corrupt files.
+- **Disk-space guard.** A download that would leave less than `--min-free-gib` (default 1) free is refused, and a genuinely full destination halts the run cleanly instead of writing corrupt files. The size comes from the directory listing, since the hosts publish none over HTTP.
 - **Incremental manifest writes.** The verification manifest is a SQLite database in WAL mode, so a save writes only what changed. It was previously one JSON document rewritten in full every 200 completions, which across ~450k files meant serialising tens of megabytes thousands of times while every worker waited on the same lock. Size and modification time are recorded as soon as a download lands, before its hash is computed, so an interrupted run still keeps the fast path.
-- **Cheap refreshes.** A file whose local size and the listing's published modification time both match the manifest is skipped without any network request. Only files that look changed, unknown, or `--verify-all` cost a HEAD.
+- **Cheap refreshes.** A file whose local size and the listing's published modification time both match the manifest is skipped without any network request, and the listing supplies the size for everything else, so the per-file HEAD is gone. It only ever returned nothing on these hosts, and is now used solely as a fallback for listings that omit a size.
 - **Single-instance lock.** A `.infocon_scraper.lock` PID file under the destination prevents two syncs from racing on the same drive. Stale locks (dead PID) are reclaimed automatically; override with `--force`.
 - **Signal handling.** `SIGINT`/`SIGTERM` finish in-flight downloads, save the manifest, checkpoint torrent fast-resume data, and release the lock. The torrent phase runs on its own thread and is stopped through the same signal, rather than being left running while shutdown waits on it.
 - **Honest progress.** The reported rate and totals include bytes staged by transfers still in flight, so a run pulling several multi-gigabyte archives shows real throughput instead of `0 B/s` until the first one lands.

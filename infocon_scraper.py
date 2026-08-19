@@ -106,10 +106,18 @@ class RemoteFile:
     # a rounded scheduling hint, never used for verification.
     modified: float = 0.0
     size: int | None = None
+    size_slack: int = 0
 
 
 class CurlError(RuntimeError):
-    pass
+    def __init__(self, message: str, returncode: int | None = None):
+        super().__init__(message)
+        self.returncode = returncode
+
+
+# curl exit 33: the server ignored our Range request, so a partial file cannot
+# be continued and must be fetched again from the start.
+CURL_RANGE_UNSUPPORTED = 33
 
 
 @dataclass
@@ -412,6 +420,35 @@ def _reset_host_semaphores() -> None:
         _host_semaphores.clear()
 
 
+# Neither infocon.org nor media.defcon.org honours a Range request - both
+# answer 200 with the whole body - so a partial transfer cannot be continued
+# there. Discovered per host at runtime rather than assumed, since the same
+# code serves other mirrors.
+_no_range_hosts: set[str] = set()
+_no_range_lock = threading.Lock()
+
+
+def host_supports_ranges(url: str) -> bool:
+    with _no_range_lock:
+        return urlparse(url).netloc not in _no_range_hosts
+
+
+def mark_host_without_ranges(url: str) -> bool:
+    """Record that a host ignores Range. Returns True the first time."""
+    host = urlparse(url).netloc
+    with _no_range_lock:
+        if host in _no_range_hosts:
+            return False
+        _no_range_hosts.add(host)
+        return True
+
+
+def _reset_range_support() -> None:
+    """Test hook."""
+    with _no_range_lock:
+        _no_range_hosts.clear()
+
+
 def run_curl(args: list[str], timeout: int, url: str | None = None,
              stall_guard: bool = False, kind: str = METADATA) -> subprocess.CompletedProcess:
     """Run curl under the per-host concurrency budget for *kind*.
@@ -462,43 +499,64 @@ def curl_download(url: str, local_path: str, resume: bool, timeout: int = 0) -> 
     args += [url]
     proc = run_curl(args, timeout, url=url, stall_guard=True, kind=TRANSFER)
     if proc.returncode != 0:
-        raise CurlError(f"curl download failed ({proc.returncode}) for {url}: {proc.stderr.decode(errors='replace').strip()}")
+        raise CurlError(
+            f"curl download failed ({proc.returncode}) for {url}: "
+            f"{proc.stderr.decode(errors='replace').strip()}",
+            returncode=proc.returncode,
+        )
 
 
-def download_atomic(url: str, local_path: str, remote_size: int | None) -> None:
-    """Download to a .part sibling and rename into place only after the size is
-    verified, so an interrupted or truncated transfer never leaves a file that
-    looks complete. Resumes an existing .part when the server supports it, and
-    retries with backoff on failure or size mismatch."""
+def download_atomic(url: str, local_path: str, expected_size: int | None,
+                    slack: int = 0) -> None:
+    """Download to a .part sibling and rename into place only once it looks
+    complete, so an interrupted transfer never leaves a file that looks whole.
+
+    curl's exit status is the primary integrity signal: neither archive host
+    sends Content-Length, so a truncated response surfaces as a curl transfer
+    error rather than a short body. *expected_size* is the directory listing's
+    published size and acts as a second check, compared within *slack* because
+    that value is published rounded.
+    """
     part = local_path + ".part"
     register_part(part, os.path.getsize(part) if os.path.exists(part) else 0)
     try:
-        _download_attempts(url, local_path, remote_size, part)
+        _download_attempts(url, local_path, expected_size, part, slack)
     finally:
         unregister_part(part)
 
 
-def _download_attempts(url: str, local_path: str, remote_size: int | None, part: str) -> None:
+def _download_attempts(url: str, local_path: str, expected_size: int | None, part: str,
+                       slack: int = 0) -> None:
     last_err: str | None = None
     for attempt in range(1, RUN.retries + 1):
         part_size = os.path.getsize(part) if os.path.exists(part) else 0
-        # Resume whenever staged bytes exist, including when the remote size is
-        # unknown - restarting a multi-gigabyte transfer from zero is never the
-        # cheaper option.
-        resume = part_size > 0 and (remote_size is None or part_size < remote_size)
+        # Resume whenever staged bytes exist and the host actually honours
+        # Range; restarting a multi-gigabyte transfer from zero is never the
+        # cheaper option where continuing is possible.
+        resume = (part_size > 0 and host_supports_ranges(url)
+                  and (expected_size is None or part_size < expected_size))
         try:
             curl_download(url, part, resume=resume, timeout=RUN.download_timeout)
         except CurlError as exc:
             last_err = str(exc)
+            if exc.returncode == CURL_RANGE_UNSUPPORTED and resume:
+                # The host ignores Range, so the staged bytes are unusable and
+                # every future resume against it would fail the same way.
+                if mark_host_without_ranges(url):
+                    log.warning("%s does not support resuming; transfers there restart from the "
+                                "beginning when interrupted.", urlparse(url).netloc)
+                _safe_remove(part)
+                continue
             # An overshoot means the .part is unusable for resume; start clean next time.
-            if os.path.exists(part) and remote_size and os.path.getsize(part) > remote_size:
+            if os.path.exists(part) and expected_size and os.path.getsize(part) > expected_size + slack:
                 _safe_remove(part)
             time.sleep(min(30, 3 * attempt))
             continue
         got = os.path.getsize(part) if os.path.exists(part) else 0
-        if remote_size is not None and got != remote_size:
-            last_err = f"size mismatch (got {got}, expected {remote_size})"
-            if got > remote_size:
+        if expected_size is not None and abs(got - expected_size) > slack:
+            last_err = (f"size mismatch (got {got}, expected {expected_size}"
+                        f"{f' +/- {slack}' if slack else ''})")
+            if got > expected_size + slack:
                 _safe_remove(part)
             time.sleep(min(30, 3 * attempt))
             continue
@@ -598,21 +656,45 @@ def parse_listing_date(raw: str) -> float:
 
 
 def parse_listing_size(raw: str) -> int | None:
-    """Approximate byte count from a listing's size cell, or None when unknown.
+    """Byte count from a listing's size cell, or None when unknown.
 
-    The published value is rounded ("648.6 KiB"), so this is a scheduling hint -
-    never a substitute for Content-Length when verifying a download.
+    Neither archive host sends Content-Length, so this is the only size
+    information available before a file is fetched. It is published rounded
+    ("648.6 KiB"), so pair it with parse_listing_size_slack() when comparing.
     """
+    parsed = _parse_listing_size_parts(raw)
+    return None if parsed is None else parsed[0]
+
+
+def parse_listing_size_slack(raw: str) -> int:
+    """How far a real byte count may differ from the listed one.
+
+    The listing shows a fixed number of decimals in whichever unit fits, so the
+    uncertainty is one display step - 0.1 KiB is 102 bytes, 0.1 GiB is 107 MB -
+    rather than a flat percentage. A plain byte count is exact.
+    """
+    parsed = _parse_listing_size_parts(raw)
+    return 0 if parsed is None else parsed[1]
+
+
+def _parse_listing_size_parts(raw: str) -> tuple[int, int] | None:
     text = (raw or "").strip()
     if not text or text == "-":
         return None
-    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]*)", text)
+    match = re.fullmatch(r"([0-9]+(?:\.([0-9]+))?)\s*([A-Za-z]*)", text)
     if not match:
         return None
-    multiplier = LISTING_SIZE_UNITS.get(match.group(2).upper() or "B")
+    multiplier = LISTING_SIZE_UNITS.get(match.group(3).upper() or "B")
     if multiplier is None:
         return None
-    return int(float(match.group(1)) * multiplier)
+    value = int(float(match.group(1)) * multiplier)
+    decimals = match.group(2)
+    if multiplier == 1:
+        slack = 0  # a byte count is published exactly
+    else:
+        step = 10 ** -len(decimals) if decimals else 1
+        slack = max(1, int(step * multiplier))
+    return value, slack
 
 
 def safe_child_name(name: str) -> str | None:
@@ -682,6 +764,7 @@ def list_directory(url: str) -> list[dict]:
             "is_dir": href.endswith("/"),
             "modified": modified,
             "size": parse_listing_size(size_text),
+            "size_slack": parse_listing_size_slack(size_text),
         })
 
     newest_first = RUN.content_order == "newest"
@@ -791,7 +874,8 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: Manifest, c
                     if stats:
                         stats.add_discovered()
                     enqueue(RemoteFile(url=child_url, rel_path=child_rel,
-                                       modified=entry["modified"], size=entry.get("size")))
+                                       modified=entry["modified"], size=entry.get("size"),
+                                       size_slack=entry.get("size_slack", 0)))
 
         for url, rel in roots:
             if skipped(rel):
@@ -1133,31 +1217,38 @@ def _sync_one_file(item: RemoteFile, local_path: str, manifest: Manifest,
     if exists and not verify_all and _listing_matches_manifest(item, entry, local_size):
         return "skip-known-good", 0
 
-    try:
-        remote_size = curl_head_size(item.url)
-    except CurlError as exc:
-        log.error("HEAD failed for %s: %s", item.url, exc)
-        return "error", 0
+    # The directory listing is the only size the archive hosts publish: neither
+    # infocon.org nor media.defcon.org returns Content-Length, so a HEAD per
+    # file bought nothing but a round trip. It is kept only as a fallback for
+    # listings that omit a size, and for other hosts that do answer.
+    expected_size, slack = item.size, item.size_slack
+    if expected_size is None:
+        try:
+            expected_size = curl_head_size(item.url)
+            slack = 0
+        except CurlError as exc:
+            log.error("HEAD failed for %s: %s", item.url, exc)
+            return "error", 0
 
-    if exists and remote_size is not None and local_size == remote_size:
-        if entry and entry.get("size") == remote_size and not verify_all:
-            _record(manifest, rel, item, remote_size, entry.get("sha256"))
+    if exists and expected_size is not None and abs(local_size - expected_size) <= slack:
+        if entry and entry.get("size") == local_size and not verify_all:
+            _record(manifest, rel, item, local_size, entry.get("sha256"))
             return "skip-known-good", 0
         digest = sha256_file(local_path)
         if entry and entry.get("sha256") == digest:
-            _record(manifest, rel, item, remote_size, digest)
+            _record(manifest, rel, item, local_size, digest)
             return "skip-verified", 0
         if entry and entry.get("sha256") != digest:
             log.warning("Corruption detected for %s (hash mismatch), re-downloading", rel)
         else:
-            _record(manifest, rel, item, remote_size, digest)
+            _record(manifest, rel, item, local_size, digest)
             return "baseline-recorded", 0
 
     part_path = local_path + ".part"
     part_size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
 
     if dry_run:
-        resuming = remote_size and (0 < local_size < remote_size or 0 < part_size < remote_size)
+        resuming = expected_size and (0 < local_size < expected_size or 0 < part_size < expected_size)
         action = "would-resume" if resuming else "would-download"
         log.info("[dry-run] %s -> %s", action, rel)
         return action, 0
@@ -1165,20 +1256,22 @@ def _sync_one_file(item: RemoteFile, local_path: str, manifest: Manifest,
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
 
     # Only the bytes still needed matter for the space check (resuming a .part).
-    needed = (remote_size - part_size) if (remote_size and part_size < remote_size) else (remote_size or 0)
-    if remote_size and not has_free_space(os.path.dirname(local_path) or ".", needed):
+    resumable = host_supports_ranges(item.url) and expected_size and part_size < expected_size
+    needed = (expected_size - part_size) if resumable else (expected_size or 0)
+    if expected_size and not has_free_space(os.path.dirname(local_path) or ".", needed + slack):
         log.error("Insufficient free space for %s (needs ~%d bytes)", rel, needed)
         return "error-diskfull", 0
 
     try:
-        download_atomic(item.url, local_path, remote_size)
+        download_atomic(item.url, local_path, expected_size, slack)
     except CurlError as exc:
         log.error("Download failed for %s: %s", item.url, exc)
         return "error", 0
 
     final_size = os.path.getsize(local_path)
-    if remote_size is not None and final_size != remote_size:
-        log.error("Size mismatch after download for %s (got %d, expected %d)", rel, final_size, remote_size)
+    if expected_size is not None and abs(final_size - expected_size) > slack:
+        log.error("Size mismatch after download for %s (got %d, expected %d +/- %d)",
+                  rel, final_size, expected_size, slack)
         return "error", 0
 
     # Record size and mtime now so an interrupted run still gets the fast path
@@ -1315,7 +1408,8 @@ def discover_mirror_files(root_url: str, filters: list[str] | None) -> list[Remo
     return [
         RemoteFile(url=urljoin(urljoin(root_url, "mirrors/"), entry["href"]),
                    rel_path=os.path.join("mirrors", entry["name"]),
-                   modified=entry["modified"], size=entry.get("size"))
+                   modified=entry["modified"], size=entry.get("size"),
+                   size_slack=entry.get("size_slack", 0))
         for entry in entries
         if not entry["is_dir"]
         and not entry["name"].lower().endswith(".torrent")
@@ -1545,7 +1639,8 @@ def scan_infocon_tree(
                     elif is_http:
                         http_files.append(RemoteFile(url=child_url, rel_path=child_rel,
                                                     modified=entry["modified"],
-                                                    size=entry.get("size")))
+                                                    size=entry.get("size"),
+                                                    size_slack=entry.get("size_slack", 0)))
                         if stats:
                             stats.add_discovered()
                 now = time.time()
