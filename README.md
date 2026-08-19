@@ -46,7 +46,7 @@ The current six-drive DDV layout is:
 | E | 8 TB | NTLM-9 hash tables | Separate companion dataset |
 | F | 6 TB | 4.2 Net NTLMv1 rainbow table | Separate companion dataset |
 
-Drive A is the InfoCon archive this project is designed to build. Drive D's VX Underground material is represented by the relevant mirror collections described below. Drives B, C, E, and F are separate hash-table datasets and are not automatically supplied by `infocon_scraper.py`; keep them in their own destination trees rather than combining them with the InfoCon mirror.
+Drive A is the InfoCon archive this project rebuilds so people can recover the conference archive even when they cannot attend DEF CON in person. Drive D's VX Underground material is represented by the relevant mirror collections described below. Drives B, C, E, and F are separate hash-table datasets and are not automatically supplied by `infocon_scraper.py`; keep them in their own destination trees rather than combining them with the InfoCon mirror.
 
 The `rainbow tables/` directory is the authoritative source for the separate hash-table datasets. Its README lists A51 (1.5 TB), LANMAN (0.4 TB), MD5 (3.5 TB), MySQL SHA-1 (1.3 TB), NTLM (3.6 TB), NTLM 9 (6.7 TB), and NetNTLMv1 (4.3 TB compressed from 8 TB). It is excluded from the default archive crawl and torrent inventory because it is a separate multi-terabyte drive workload. Opt in explicitly:
 
@@ -57,6 +57,8 @@ python infocon_scraper.py --dest "/path/to/drive" \
 python fetch_defcon_torrents.py --dest "/path/to/drive" \
   --include-rainbow-tables
 ```
+
+The Rainbow Tables schema should be kept as separate DDV source-drive content: LANMAN/MSSQL/NTLM on Drive B, A5/1/GSM/MD5 on Drive C, NTLM-9 on Drive E, and the 4.2 Net-NTLMv1 table on Drive F. Do not place these datasets under Drive A's InfoCon archive tree.
 
 To target the DDV-related mirror collection without crawling every conference:
 
@@ -118,6 +120,18 @@ python -m pip install -r requirements.txt
 ```
 
 ## HTTP Sync
+
+### Fresh Builds and Refreshes
+
+The destination may be completely empty. The online InfoCon and media sources are authoritative; existing files are only used to resume and verify. The same command can be rerun later to keep a drive current as new conferences, talks, torrents, and corrections appear.
+
+For an interactive setup that prompts for the destination, recent physical-archive exclusions, HTTP tuning, torrent scope, and optional Rainbow Tables inclusion:
+
+```bash
+./.venv/bin/python infocon_interactive.py
+```
+
+Alternatively copy `.env.example` to `.env`, edit the settings, and run the same command. Rainbow Tables remain excluded unless `INFOCON_INCLUDE_RAINBOW_TABLES=true` is explicitly set.
 
 The destination may be a completely empty drive. The scraper does not use the existing drive as an inventory and does not require any pre-existing folders, torrent files, or manifest. It creates the destination tree as it discovers the current online InfoCon layout.
 

@@ -942,8 +942,7 @@ def main() -> int:
                          help="Comma-separated media.defcon.org folder names to skip entirely, e.g. "
                               "'DEF CON 30,DEF CON 31' when fetching those years via BitTorrent instead")
     parser.add_argument("--skip-recent", default=None,
-                         help="Comma-separated substrings to skip across InfoCon conferences, media folders, "
-                              "and DEF CON torrents; useful for archives arriving separately")
+                        help="Comma-separated substrings to exclude from torrent ownership while leaving matching paths available to HTTP")
     parser.add_argument("--no-skip-torrented", action="store_true",
                          help="When 'defcon-media' is a source, do NOT auto-skip folders that already have a "
                               "torrent (by default such folders are skipped so HTTP only fills gaps like DEF CON 34)")

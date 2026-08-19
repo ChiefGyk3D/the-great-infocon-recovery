@@ -1,4 +1,5 @@
 .venv/
+.env
 .monitor-tools/
 .monitor-pkgs/
 monitor-test.out.tmp.*
