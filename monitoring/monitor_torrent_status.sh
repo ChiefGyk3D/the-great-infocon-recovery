@@ -14,6 +14,18 @@ while :; do
     if [[ -n "$latest_candidates" ]]; then
         printf '%s\n\n' "$latest_candidates"
     fi
+    printf 'Torrent discovery:\n'
+    latest_discovery=$(grep -E 'Resuming torrent discovery checkpoint:|Recursive torrent discovery started|Torrent discovery: scanned|Recursive torrent discovery complete:' "$LOG" 2>/dev/null | tail -n 1 || true)
+    if [[ -n "$latest_discovery" ]]; then
+        printf '%s\n' "$latest_discovery"
+    else
+        printf 'No torrent discovery status emitted yet.\n'
+    fi
+    latest_retry=$(grep -E 'Torrent listing failed|Skipping torrent listing' "$LOG" 2>/dev/null | tail -n 1 || true)
+    if [[ -n "$latest_retry" ]]; then
+        printf 'Latest retry: %s\n' "$latest_retry"
+    fi
+    printf '\n'
     awk -v max_idle="$MAX_IDLE_LINES" '
         /^--- [0-9]+\/[0-9]+ complete/ {
             summary=$0

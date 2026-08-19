@@ -153,11 +153,14 @@ def curl_text(url: str, settings: TorrentSettings, timeout: int | None = None,
         ["curl", "-sS", "-A", USER_AGENT, "--retry", str(settings.retries if retries is None else retries),
          "--retry-delay", str(settings.retry_delay), "--retry-all-errors",
          "--max-time", str(timeout or settings.request_timeout), "-L", "--fail", url],
-        capture_output=True, text=True,
+        capture_output=True, text=False,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"curl failed ({proc.returncode}) for {url}: {proc.stderr.strip()}")
-    return proc.stdout
+        raise RuntimeError(
+            f"curl failed ({proc.returncode}) for {url}: "
+            f"{proc.stderr.decode(errors='replace').strip()}"
+        )
+    return proc.stdout.decode("utf-8", errors="replace")
 
 
 def curl_download(url: str, local_path: str, settings: TorrentSettings) -> None:
@@ -166,10 +169,13 @@ def curl_download(url: str, local_path: str, settings: TorrentSettings) -> None:
          "--retry-delay", str(settings.retry_delay), "--retry-all-errors",
          "--max-time", str(settings.request_timeout), "-L", "--fail",
          "-o", local_path, url],
-        capture_output=True, text=True,
+        capture_output=True, text=False,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"curl failed ({proc.returncode}) for {url}: {proc.stderr.strip()}")
+        raise RuntimeError(
+            f"curl failed ({proc.returncode}) for {url}: "
+            f"{proc.stderr.decode(errors='replace').strip()}"
+        )
 
 
 def _listing_entries(html: str) -> list[tuple[str, str, bool]]:
