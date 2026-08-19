@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import argparse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -62,8 +63,38 @@ def number(label: str, default: int, minimum: int = 1) -> int:
 
 
 def main() -> int:
-    env = load_env(ROOT / ".env")
+    parser = argparse.ArgumentParser(description="Simple InfoCon archive setup and refresh launcher")
+    parser.add_argument("--repeat", action="store_true", help="Run .env without prompts")
+    parser.add_argument("--config", default=str(ROOT / ".env"), help="Settings file for --repeat")
+    args = parser.parse_args()
+    env = load_env(Path(args.config))
     env = {**env, **os.environ}
+
+    if args.repeat:
+        destination = env.get("INFOCON_DEST", "/media/chiefgyk3d/infocon.org DC30")
+        skip_recent = env.get("INFOCON_SKIP_RECENT", "DEF CON 34,BSides Las Vegas 2026")
+        defcon_only = env.get("INFOCON_TORRENT_DEFCON_ONLY", "30,31,32,33,34")
+        workers = int(env.get("INFOCON_WORKERS", "8"))
+        pending = int(env.get("INFOCON_MAX_PENDING_DOWNLOADS", str(workers * 4)))
+        discovery_workers = int(env.get("INFOCON_TORRENT_DISCOVERY_WORKERS", "8"))
+        stalled_minutes = int(env.get("INFOCON_TORRENT_STALLED_MINUTES", "30"))
+        command = [
+            str(ROOT / ".venv/bin/python"), str(ROOT / "infocon_scraper.py"),
+            "--dest", destination, "--with-torrents",
+            "--skip-recent", skip_recent,
+            "--torrent-defcon-only", defcon_only,
+            "--torrent-discovery-workers", str(discovery_workers),
+            "--torrent-stalled-minutes", str(stalled_minutes),
+            "--max-pending-downloads", str(pending),
+        ]
+        if env.get("INFOCON_INCLUDE_RAINBOW_TABLES", "false").lower() in {"1", "true", "yes", "y"}:
+            command.append("--torrent-include-rainbow-tables")
+        print("Repeat configuration:")
+        print(" ".join(shlex.quote(part) for part in command))
+        if not yes_no("Start this refresh now?", True):
+            print("Cancelled.")
+            return 0
+        return subprocess.call(command, cwd=ROOT)
     print("InfoCon Archive Builder")
     print("This wizard builds or refreshes the current online archive.")
     destination = env.get("INFOCON_DEST") or ask("Destination drive", "/media/chiefgyk3d/infocon.org DC30")

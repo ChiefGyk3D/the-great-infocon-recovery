@@ -125,15 +125,27 @@ python -m pip install -r requirements.txt
 
 The destination may be completely empty. The online InfoCon and media sources are authoritative; existing files are only used to resume and verify. The same command can be rerun later to keep a drive current as new conferences, talks, torrents, and corrections appear.
 
-For an interactive setup that prompts for the destination, recent physical-archive exclusions, HTTP tuning, torrent scope, and optional Rainbow Tables inclusion:
+Use the single friendly entrypoint for normal users:
 
 ```bash
-./.venv/bin/python infocon_interactive.py
+./.venv/bin/python infocon.py
 ```
 
-Alternatively copy `.env.example` to `.env`, edit the settings, and run the same command. Rainbow Tables remain excluded unless `INFOCON_INCLUDE_RAINBOW_TABLES=true` is explicitly set.
+It opens a numbered wizard for destination, refresh scope, HTTP workers, torrent scope, stalled-torrent fallback, and Rainbow Tables confirmation. For repeat runs, copy `.env.example` to `.env`, edit it once, then use:
 
-The destination may be a completely empty drive. The scraper does not use the existing drive as an inventory and does not require any pre-existing folders, torrent files, or manifest. It creates the destination tree as it discovers the current online InfoCon layout.
+```bash
+./.venv/bin/python infocon.py --repeat
+```
+
+Advanced users can bypass the wizard and use the full scraper CLI:
+
+```bash
+./.venv/bin/python infocon.py --advanced --dest "/path/to/drive" --with-torrents
+```
+
+Rainbow Tables remain excluded unless explicitly enabled in the wizard or `.env`.
+
+The scraper does not use the existing drive as an inventory and does not require any pre-existing folders, torrent files, or manifest. It creates the destination tree as it discovers the current online InfoCon layout.
 
 Run an incremental full sync. Directory listings are ordered by their published modification metadata, newest first, including nested subdirectories. Replace the destination with the mount point on your system:
 
