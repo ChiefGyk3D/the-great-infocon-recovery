@@ -147,9 +147,10 @@ def build_libtorrent_session(settings: TorrentSettings) -> lt.session:
     return lt.session(params)
 
 
-def curl_text(url: str, settings: TorrentSettings, timeout: int | None = None) -> str:
+def curl_text(url: str, settings: TorrentSettings, timeout: int | None = None,
+              retries: int | None = None) -> str:
     proc = subprocess.run(
-        ["curl", "-sS", "-A", USER_AGENT, "--retry", str(settings.retries),
+        ["curl", "-sS", "-A", USER_AGENT, "--retry", str(settings.retries if retries is None else retries),
          "--retry-delay", str(settings.retry_delay), "--retry-all-errors",
          "--max-time", str(timeout or settings.request_timeout), "-L", "--fail", url],
         capture_output=True, text=True,
@@ -211,7 +212,7 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
     def fetch_listing(item: tuple[str, str]) -> tuple[str, str, list[tuple[str, str, bool]]]:
         dir_url, save_path = item
         return dir_url, save_path, _listing_entries(curl_text(
-            dir_url, settings, timeout=min(settings.request_timeout, 30)
+            dir_url, settings, timeout=min(settings.request_timeout, 30), retries=0
         ))
 
     pending: dict = {}

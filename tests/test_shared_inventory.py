@@ -300,7 +300,8 @@ class TestTorrentDiscoveryRetry(unittest.TestCase):
         )
         attempts = 0
 
-        def fake_curl_text(url: str, settings: object, timeout: int | None = None) -> str:
+        def fake_curl_text(url: str, settings: object, timeout: int | None = None,
+                   retries: int | None = None) -> str:
             nonlocal attempts
             attempts += 1
             if attempts == 1:
