@@ -108,7 +108,15 @@ class CurlError(RuntimeError):
 @dataclass
 class RunConfig:
     retries: int = 4
-    download_timeout: int = 3600
+    # 0 disables the hard per-attempt wall-clock cap. A fixed cap cannot work
+    # for this archive: a 128 GB word list at a few MB/s needs many hours, and
+    # curl restarts an --max-time abort from byte zero, so a capped attempt can
+    # never converge. Stalls are detected by throughput instead (see below).
+    download_timeout: int = 0
+    # Abort a transfer that averages less than min_speed_bytes/s for
+    # stall_seconds - a genuinely dead connection, not merely a slow one.
+    min_speed_bytes: int = 1024
+    stall_seconds: int = 300
     listing_retries: int = 3
     listing_retry_delay: float = 5.0
     min_free_bytes: int = 1 << 30  # keep at least 1 GiB free
@@ -331,16 +339,25 @@ def _host_semaphore(url: str) -> threading.Semaphore | None:
         return sem
 
 
-def run_curl(args: list[str], timeout: int, url: str | None = None) -> subprocess.CompletedProcess:
+def run_curl(args: list[str], timeout: int, url: str | None = None,
+             stall_guard: bool = False) -> subprocess.CompletedProcess:
+    """Run curl under the per-host concurrency cap.
+
+    *timeout* is a hard wall-clock cap and is only applied when positive; bulk
+    transfers pass stall_guard=True instead so a slow-but-alive download is
+    never killed and restarted from the beginning.
+    """
+    command = ["curl", "-sS", "-A", USER_AGENT, "--retry", "3", "--retry-delay", "3",
+               "--retry-all-errors", "--connect-timeout", "30"]
+    if stall_guard:
+        command += ["--speed-limit", str(RUN.min_speed_bytes), "--speed-time", str(RUN.stall_seconds)]
+    if timeout and timeout > 0:
+        command += ["--max-time", str(timeout)]
     sem = _host_semaphore(url) if url else None
     if sem:
         sem.acquire()
     try:
-        return subprocess.run(
-            ["curl", "-sS", "-A", USER_AGENT, "--retry", "3", "--retry-delay", "3",
-             "--retry-all-errors", "--max-time", str(timeout)] + args,
-            capture_output=True, text=False,
-        )
+        return subprocess.run(command + args, capture_output=True, text=False)
     finally:
         if sem:
             sem.release()
@@ -364,12 +381,13 @@ def curl_head_size(url: str, timeout: int = 30) -> int | None:
     return size
 
 
-def curl_download(url: str, local_path: str, resume: bool, timeout: int = 3600) -> None:
+def curl_download(url: str, local_path: str, resume: bool, timeout: int = 0) -> None:
     args = ["-L", "--fail", "-o", local_path]
     if resume:
+        # Also makes curl's own --retry resume rather than truncate and restart.
         args += ["-C", "-"]
     args += [url]
-    proc = run_curl(args, timeout, url=url)
+    proc = run_curl(args, timeout, url=url, stall_guard=True)
     if proc.returncode != 0:
         raise CurlError(f"curl download failed ({proc.returncode}) for {url}: {proc.stderr.decode(errors='replace').strip()}")
 
@@ -382,7 +400,11 @@ def download_atomic(url: str, local_path: str, remote_size: int | None) -> None:
     part = local_path + ".part"
     last_err: str | None = None
     for attempt in range(1, RUN.retries + 1):
-        resume = bool(remote_size and os.path.exists(part) and 0 < os.path.getsize(part) < remote_size)
+        part_size = os.path.getsize(part) if os.path.exists(part) else 0
+        # Resume whenever staged bytes exist, including when the remote size is
+        # unknown - restarting a multi-gigabyte transfer from zero is never the
+        # cheaper option.
+        resume = part_size > 0 and (remote_size is None or part_size < remote_size)
         try:
             curl_download(url, part, resume=resume, timeout=RUN.download_timeout)
         except CurlError as exc:
@@ -399,9 +421,52 @@ def download_atomic(url: str, local_path: str, remote_size: int | None) -> None:
                 _safe_remove(part)
             time.sleep(min(30, 3 * attempt))
             continue
-        os.replace(part, local_path)
+        try:
+            os.replace(part, local_path)
+        except OSError as exc:
+            # Another worker downloading the same path would race on this
+            # rename; _claim_path() is what prevents that, so surface a clear
+            # message instead of a bare ENOENT if it ever happens again.
+            raise CurlError(f"could not stage {part} into place for {url}: {exc}") from exc
         return
     raise CurlError(f"download failed after {RUN.retries} attempts for {url}: {last_err}")
+
+
+# Guards against two workers writing the same destination file at once. The
+# duplicate crawls that used to make this happen are fixed at the source, but a
+# collision here silently corrupts a .part and then fails its rename, so the
+# invariant is enforced rather than assumed.
+_active_paths: set[str] = set()
+_finished_paths: set[str] = set()
+_paths_lock = threading.Lock()
+
+
+def _claim_path(local_path: str) -> str | None:
+    """Reserve *local_path* for this worker.
+
+    Returns the claim token, or None when another worker holds the path or has
+    already synced it during this run.
+    """
+    key = os.path.normpath(local_path)
+    with _paths_lock:
+        if key in _active_paths or key in _finished_paths:
+            return None
+        _active_paths.add(key)
+    return key
+
+
+def _release_path(key: str, finished: bool) -> None:
+    with _paths_lock:
+        _active_paths.discard(key)
+        if finished:
+            _finished_paths.add(key)
+
+
+def _reset_path_registry() -> None:
+    """Test hook: clears the cross-run_sync duplicate-download registry."""
+    with _paths_lock:
+        _active_paths.clear()
+        _finished_paths.clear()
 
 
 def _safe_remove(path: str) -> None:
@@ -613,7 +678,27 @@ def is_unpacked_archive_duplicate(local_path: str) -> bool:
 
 def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
               verify_all: bool, dry_run: bool) -> tuple[str, int]:
+    """Sync one remote file, guaranteeing exclusive ownership of its local path.
+
+    The concurrent HTTP phases (main sync plus any stalled-torrent fallback) can
+    legitimately discover the same file, and two workers sharing one `.part`
+    corrupt it and then race on the rename into place.
+    """
     local_path = os.path.join(dest_root, item.rel_path)
+    claim = _claim_path(local_path)
+    if claim is None:
+        return "skip-duplicate-path", 0
+    finished = False
+    try:
+        result, nbytes = _sync_one_file(item, local_path, manifest, verify_all, dry_run)
+        finished = not result.startswith("error")
+        return result, nbytes
+    finally:
+        _release_path(claim, finished)
+
+
+def _sync_one_file(item: RemoteFile, local_path: str, manifest: Manifest,
+                   verify_all: bool, dry_run: bool) -> tuple[str, int]:
     rel = item.rel_path
 
     if is_unpacked_archive_duplicate(local_path):
@@ -875,6 +960,57 @@ def build_defcon_media_fallback_root(root_url: str, name: str) -> tuple[str, str
     return urljoin(root_url, f"{quote(name)}/"), f"cons/DEF CON/{name}"
 
 
+def resolve_stalled_fallback_root(spec, dest_root: str, media_root: str) -> tuple[str, str] | None:
+    """Narrowest HTTP root holding a stalled torrent's content, or None.
+
+    A published .torrent sits *beside* the folder it describes, so the torrent
+    URL's parent directory is emphatically not the fallback root: for
+    'cons/2600 archive v1 - infocon.org.torrent' that parent is the whole of
+    cons/, and crawling it once per stalled torrent multiplies the entire
+    conference tree by the number of stalled torrents. The content lives in the
+    sibling folder named after the archive, which is what this returns.
+
+    The folder name is derived offline from the torrent name. A wrong guess
+    costs one failed directory listing and nothing else, which is cheaper and
+    far safer than falling back to a broader root.
+    """
+    from fetch_defcon_torrents import torrent_content_folder
+
+    if re.search(r"\bdef con\b", spec.name, re.IGNORECASE):
+        return build_defcon_media_fallback_root(media_root, spec.name)
+
+    folder = torrent_content_folder(spec.name)
+    if not folder or folder in (os.curdir, os.pardir) or "/" in folder or "\\" in folder:
+        # Anything but a single plain directory name would resolve above the
+        # torrent's own folder - at worst to the site root - so refuse it.
+        log.warning("No usable content folder for stalled torrent %s (derived %r); skipping HTTP fallback.",
+                    spec.name, folder)
+        return None
+    parent_rel = os.path.relpath(spec.save_path, dest_root)
+    if parent_rel == os.curdir or parent_rel.startswith(os.pardir):
+        parent_rel = ""
+    parent_url = urljoin(spec.url, "./")
+    child_url = urljoin(parent_url, quote(folder) + "/")
+    child_rel = os.path.join(parent_rel, folder) if parent_rel else folder
+    return child_url, child_rel
+
+
+def root_is_covered(rel_path: str, planned_rels: list[str]) -> bool:
+    """True when some already-planned HTTP root contains *rel_path*.
+
+    Stalled non-DEF CON torrents normally need no fallback crawl at all: their
+    conference folder is already part of the ordinary infocon.org sync.
+    """
+    target = rel_path.replace(os.sep, "/").strip("/").lower()
+    for planned in planned_rels:
+        candidate = planned.replace(os.sep, "/").strip("/").lower()
+        if not candidate:
+            return True
+        if target == candidate or target.startswith(candidate + "/"):
+            return True
+    return False
+
+
 def scan_infocon_tree(
     http_roots: list[tuple[str, str]],
     extra_torrent_roots: list[tuple[str, str]],
@@ -1101,8 +1237,17 @@ def main() -> int:
                          help="Directory/file discovery order (default: newest)")
     parser.add_argument("--retries", type=int, default=4,
                          help="Per-file download attempts before giving up (default: 4)")
-    parser.add_argument("--download-timeout", type=int, default=3600,
-                         help="Max seconds for a single file download attempt (default: 3600)")
+    parser.add_argument("--download-timeout", type=int, default=0,
+                         help="Hard wall-clock cap in seconds for a single download attempt; 0 disables it "
+                              "(default: 0). A fixed cap cannot fit this archive - the largest word lists "
+                              "need many hours - and an aborted attempt restarts from the beginning, so "
+                              "stalls are detected with --min-speed-bytes/--stall-timeout instead.")
+    parser.add_argument("--min-speed-bytes", type=int, default=1024,
+                         help="Abort a download averaging less than this many bytes/s for --stall-timeout "
+                              "seconds (default: 1024)")
+    parser.add_argument("--stall-timeout", type=int, default=300,
+                         help="Seconds below --min-speed-bytes before a download is treated as stalled "
+                              "(default: 300)")
     parser.add_argument("--listing-retries", type=int, default=3,
                         help="Additional directory-listing retries after curl gives up (default: 3)")
     parser.add_argument("--listing-retry-delay", type=float, default=5.0,
@@ -1187,7 +1332,9 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
 
     RUN.retries = max(1, args.retries)
-    RUN.download_timeout = max(1, args.download_timeout)
+    RUN.download_timeout = max(0, args.download_timeout)
+    RUN.min_speed_bytes = max(0, args.min_speed_bytes)
+    RUN.stall_seconds = max(1, args.stall_timeout)
     RUN.listing_retries = max(0, args.listing_retries)
     RUN.listing_retry_delay = max(0.0, args.listing_retry_delay)
     RUN.min_free_bytes = max(0, args.min_free_gib) * (1 << 30)
@@ -1240,11 +1387,16 @@ def main() -> int:
         reporter.start()
 
     inventory_thread: threading.Thread | None = None
+    fallback_pool: ThreadPoolExecutor | None = None
     try:
         counts: dict[str, int] = {}
-        fallback_threads: list[threading.Thread] = []
         fallback_counts: dict[str, int] = {}
         fallback_counts_lock = threading.Lock()
+        fallback_roots_started: set[str] = set()
+        # Every planned HTTP root, so a stalled torrent whose content the sync is
+        # already fetching does not trigger a redundant second crawl of it.
+        planned_rels = [rel for _, rel in roots]
+        http_plan_finished = threading.Event()
         if args.with_torrents:
             torrent_only = only_cons or None
             torrent_ready = threading.Event()
@@ -1298,13 +1450,27 @@ def main() -> int:
                     shared_inventory_ready.set()
 
             def run_stalled_http_fallback(spec) -> None:
-                if re.search(r"\bdef con\b", spec.name, re.IGNORECASE):
-                    root = build_defcon_media_fallback_root(args.defcon_media_url, spec.name)
-                else:
-                    root = (urljoin(spec.url, "./"), os.path.relpath(spec.save_path, args.dest))
-                log.warning("Torrent %s is stalled; starting HTTP fallback for %s", spec.name, root[1])
+                try:
+                    root = resolve_stalled_fallback_root(spec, args.dest, args.defcon_media_url)
+                except Exception:  # noqa: BLE001 - one bad spec must not kill the fallback queue
+                    log.exception("Could not resolve an HTTP fallback root for %s", spec.name)
+                    return
+                if root is None:
+                    return
+                url, rel = root
+                if not http_plan_finished.is_set() and root_is_covered(rel, planned_rels):
+                    log.info("Torrent %s is stalled; %s is already in the HTTP sync plan, "
+                             "no extra crawl needed.", spec.name, rel)
+                    return
+                with fallback_counts_lock:
+                    if rel in fallback_roots_started:
+                        log.info("Torrent %s is stalled; an HTTP fallback for %s is already running.",
+                                 spec.name, rel)
+                        return
+                    fallback_roots_started.add(rel)
+                log.warning("Torrent %s is stalled; starting HTTP fallback for %s", spec.name, rel)
                 result = run_sync(
-                    [root], args.dest, manifest, args.crawl_workers, args.workers,
+                    [(url, rel)], args.dest, manifest, args.crawl_workers, args.workers,
                     args.verify_all, args.dry_run, stop_requested, [],
                     args.max_pending_downloads, stats
                 )
@@ -1313,12 +1479,14 @@ def main() -> int:
                         fallback_counts[key] = fallback_counts.get(key, 0) + value
 
             def start_stalled_http_fallback(spec) -> None:
-                thread = threading.Thread(
-                    target=run_stalled_http_fallback, args=(spec,),
-                    name=f"http-fallback-{spec.name}", daemon=False
-                )
-                fallback_threads.append(thread)
-                thread.start()
+                # One shared, serialized queue. A thread per stalled torrent used
+                # to spawn a full crawl+download pool each, which at ~240 stalled
+                # torrents meant ~900 threads all contending for the same handful
+                # of per-host connection slots.
+                try:
+                    fallback_pool.submit(run_stalled_http_fallback, spec)
+                except RuntimeError:
+                    log.warning("Shutting down; skipping HTTP fallback for %s", spec.name)
 
             def run_torrent_phase() -> None:
                 try:
@@ -1334,6 +1502,9 @@ def main() -> int:
                     torrent_discovery.set()
                     torrent_ready.set()
 
+            # Serialized so that N stalled torrents cost one crawl at a time,
+            # not N concurrent crawl+download pools.
+            fallback_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="http-fallback")
             torrent_thread = threading.Thread(
                 target=run_torrent_phase, name="defcon-torrents", daemon=False
             )
@@ -1368,6 +1539,9 @@ def main() -> int:
                     args.max_pending_downloads, stats
                 ).items():
                     counts[key] = counts.get(key, 0) + value
+            # From here on nothing else is scheduled to fetch this content over
+            # HTTP, so a stalled torrent's fallback is no longer redundant.
+            http_plan_finished.set()
         else:
             counts = run_sync(roots, args.dest, manifest, args.crawl_workers, args.workers,
                               args.verify_all, args.dry_run, stop_requested, initial_files,
@@ -1377,8 +1551,11 @@ def main() -> int:
             inventory_thread.join()
         if torrent_thread:
             torrent_thread.join()
-        for fallback_thread in fallback_threads:
-            fallback_thread.join()
+        http_plan_finished.set()
+        if fallback_pool:
+            # The torrent thread has stopped, so no further fallbacks can be
+            # queued; drain whatever it handed over.
+            fallback_pool.shutdown(wait=True)
         if reporter:
             reporter.stop()
             reporter.join(timeout=args.status_interval + 2)

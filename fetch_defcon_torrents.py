@@ -380,6 +380,36 @@ def discover_torrents_indexed(roots: list[tuple[str, str]], settings: TorrentSet
     return specs
 
 
+def _status_is_paused(status) -> bool:
+    """True when libtorrent reports the torrent as paused.
+
+    `torrent_status.flags` is the authoritative source in libtorrent 2.x; the
+    legacy `.paused` attribute is used as a fallback so the helper keeps working
+    on builds that do not expose flags.
+    """
+    flags = getattr(status, "flags", None)
+    if flags is not None:
+        try:
+            return bool(flags & lt.torrent_flags.paused)
+        except TypeError:
+            pass
+    return bool(getattr(status, "paused", False))
+
+
+def _wants_to_download(name: str, status, selected_names: set[str]) -> bool:
+    """True when the scheduler has actually asked this torrent to download.
+
+    A torrent that we paused ourselves - because it is queued behind
+    `--max-active` - always reports zero peers and zero download rate. Treating
+    that as a stall would hand every queued archive to the HTTP fallback within
+    `stalled_minutes` of checking finishing, which is exactly what a run with
+    `max_active < len(torrents)` used to do.
+    """
+    if name not in selected_names:
+        return False
+    return not _status_is_paused(status)
+
+
 def torrent_priority(name: str) -> tuple[int, int, str]:
     """Sort numbered DEF CON archives newest first, then non-numbered items."""
     match = re.search(r"\b(?:DEF CON|DC)\s+(\d+)\b", name, re.IGNORECASE)
@@ -397,10 +427,21 @@ def torrent_order_key(name: str, order: str) -> tuple[int, int, str]:
     return torrent_priority(name)
 
 
+def torrent_content_folder(name: str) -> str:
+    """The published folder name an archive torrent corresponds to.
+
+    infocon.org publishes 'cons/2600 archive v1 - infocon.org.torrent' alongside
+    the 'cons/2600/' folder holding the same content, so stripping the archive
+    suffix maps a torrent back to the directory HTTP would fetch it from.
+    Case is preserved because that folder name is used to build URLs and paths.
+    """
+    normalized = re.sub(r"\s+archive(?:\s+v\d+)?(?:\s+-\s+infocon\.org)?$", "", name, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def torrent_logical_name(name: str) -> str:
     """Normalize archive labels so duplicate published torrent locations collapse."""
-    normalized = re.sub(r"\s+archive(?:\s+v\d+)?(?:\s+-\s+infocon\.org)?$", "", name, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", normalized).strip().lower()
+    return torrent_content_folder(name).lower()
 
 
 def torrent_source_priority(spec: TorrentSpec) -> int:
@@ -547,6 +588,11 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     completed_at: dict[str, float] = {}
     no_activity_since: dict[str, float] = {}
     stalled_names: set[str] = set()
+    # Names the scheduler currently wants downloading. Only these accrue quiet
+    # time towards the stalled-torrent fallback: every other torrent is paused
+    # by us on purpose and would otherwise report zero peers / zero rate and be
+    # handed to HTTP within `stalled_minutes` of checking finishing.
+    selected_names: set[str] = set()
 
     for spec in sorted(available, key=lambda item: torrent_order_key(item.name, settings.torrent_order)):
         name = spec.name
@@ -598,7 +644,12 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                     elif settings.seed_time > 0 and time.time() - completed_at[name] >= settings.seed_time * 60:
                         h.pause()
                 else:
-                    if checking_complete and stalled_callback is not None:
+                    if not _wants_to_download(name, s, selected_names):
+                        # Queued behind the active-torrent limit (or paused for
+                        # another reason): it is not stalled, it was never given
+                        # a chance to run, so its quiet timer must not accrue.
+                        no_activity_since.pop(name, None)
+                    elif checking_complete and stalled_callback is not None:
                         if s.num_peers == 0 and s.download_rate == 0:
                             no_activity_since.setdefault(name, time.time())
                             quiet_for = time.time() - no_activity_since[name]
@@ -639,6 +690,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                         handle.resume()
                     else:
                         handle.pause()
+                        no_activity_since.pop(name, None)
             total_rate = sum(a[0] for a in active)
             downloading = sum(1 for a in active if a[0] > 0)
             print(f"--- {done}/{len(handles)} complete | {total_rate / 1e6:6.2f} MB/s total | "
