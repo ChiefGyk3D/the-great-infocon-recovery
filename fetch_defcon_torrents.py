@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import os
 import re
@@ -108,6 +109,8 @@ class TorrentSettings:
     discovery_workers: int = 8
     max_defcon_active: int = 1
     torrent_order: str = "newest"
+    discovery_retries: int = 3
+    discovery_retry_delay: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -144,11 +147,11 @@ def build_libtorrent_session(settings: TorrentSettings) -> lt.session:
     return lt.session(params)
 
 
-def curl_text(url: str, settings: TorrentSettings) -> str:
+def curl_text(url: str, settings: TorrentSettings, timeout: int | None = None) -> str:
     proc = subprocess.run(
         ["curl", "-sS", "-A", USER_AGENT, "--retry", str(settings.retries),
          "--retry-delay", str(settings.retry_delay), "--retry-all-errors",
-         "--max-time", str(settings.request_timeout), "-L", "--fail", url],
+         "--max-time", str(timeout or settings.request_timeout), "-L", "--fail", url],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -207,9 +210,14 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
     print(f"Recursive torrent discovery started across {len(roots)} root(s); mirrors={'included' if include_mirrors else 'excluded'}, rainbow tables={'included' if include_rainbow_tables else 'excluded'}.")
     def fetch_listing(item: tuple[str, str]) -> tuple[str, str, list[tuple[str, str, bool]]]:
         dir_url, save_path = item
-        return dir_url, save_path, _listing_entries(curl_text(dir_url, settings))
+        return dir_url, save_path, _listing_entries(curl_text(
+            dir_url, settings, timeout=min(settings.request_timeout, 30)
+        ))
 
-    pending = {}
+    pending: dict = {}
+    retry_queue: list[tuple[float, int, tuple[str, str], int]] = []
+    retry_sequence = 0
+    scheduled_retries = 0
     last_checkpoint = time.time()
 
     def save_checkpoint() -> None:
@@ -218,7 +226,11 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
         payload = {
             "fingerprint": fingerprint,
             "visited": sorted(visited),
-            "pending": [list(item) for item in pending_items] + [list(item) for item in pending.values()],
+            "pending": (
+                [list(item) for item in pending_items]
+                + [list(item) for item, _ in pending.values()]
+                + [list(item) for _, _, item, _ in retry_queue]
+            ),
             "found": {key: {"version": version, "spec": spec.__dict__}
                       for key, (version, spec) in found.items()},
         }
@@ -228,23 +240,45 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
             json.dump(payload, stream, indent=2, sort_keys=True)
         os.replace(temporary, checkpoint_path)
 
-    with ThreadPoolExecutor(max_workers=max(1, settings.discovery_workers)) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, min(settings.discovery_workers, 4))) as pool:
         for item in pending_items:
-            pending[pool.submit(fetch_listing, item)] = item
+            pending[pool.submit(fetch_listing, item)] = (item, 0)
         pending_items = []
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        while pending or retry_queue:
+            now = time.time()
+            while retry_queue and retry_queue[0][0] <= now:
+                _, _, item, failed_attempts = heapq.heappop(retry_queue)
+                pending[pool.submit(fetch_listing, item)] = (item, failed_attempts)
+            if not pending:
+                time.sleep(min(0.25, max(0.0, retry_queue[0][0] - time.time())))
+                continue
+
+            retry_wait = None
+            if retry_queue:
+                retry_wait = max(0.0, retry_queue[0][0] - time.time())
+            done, _ = wait(pending, timeout=retry_wait, return_when=FIRST_COMPLETED)
             for future in done:
-                item = pending.pop(future)
+                item, failed_attempts = pending.pop(future)
                 dir_url, save_path = item
                 if dir_url in visited:
                     continue
-                visited.add(dir_url)
                 try:
                     _, _, entries = future.result()
                 except RuntimeError as exc:
-                    print(f"Skipping torrent listing {dir_url}: {exc}")
+                    if failed_attempts < settings.discovery_retries:
+                        failed_attempts += 1
+                        delay = settings.discovery_retry_delay * (2 ** (failed_attempts - 1))
+                        retry_sequence += 1
+                        heapq.heappush(retry_queue, (time.time() + delay, retry_sequence, item, failed_attempts))
+                        scheduled_retries += 1
+                        print(
+                            f"Torrent listing failed for {dir_url}; retry "
+                            f"{failed_attempts}/{settings.discovery_retries} in {delay:.1f}s: {exc}"
+                        )
+                    else:
+                        print(f"Skipping torrent listing {dir_url} after {settings.discovery_retries} retries: {exc}")
                     continue
+                visited.add(dir_url)
                 if len(visited) % 100 == 0:
                     print(f"Torrent discovery: scanned {len(visited)} directories, found {len(found)} torrent candidates...")
                 for href, name, is_dir in entries:
@@ -255,7 +289,8 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                         if not include_rainbow_tables and child_url.lower().rstrip("/").endswith("/rainbow%20tables"):
                             continue
                         if child_url not in visited:
-                            pending[pool.submit(fetch_listing, (child_url, os.path.join(save_path, name)))] = (child_url, os.path.join(save_path, name))
+                            child_item = (child_url, os.path.join(save_path, name))
+                            pending[pool.submit(fetch_listing, child_item)] = (child_item, 0)
                         continue
                     if not name.lower().endswith(".torrent"):
                         continue
@@ -285,7 +320,10 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                     save_checkpoint()
     save_checkpoint()
     specs = sorted((spec for _, spec in found.values()), key=lambda spec: torrent_order_key(spec.name, settings.torrent_order))
-    print(f"Recursive torrent discovery complete: scanned {len(visited)} directories, found {len(specs)} torrent files.")
+    print(
+        f"Recursive torrent discovery complete: scanned {len(visited)} directories, found {len(specs)} torrent files, "
+        f"scheduled {scheduled_retries} retries."
+    )
     for spec in specs:
         print(f"Torrent selected for download: {spec.name} -> {spec.url} -> {spec.save_path}")
     return specs

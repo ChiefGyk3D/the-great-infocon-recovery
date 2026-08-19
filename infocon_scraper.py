@@ -45,6 +45,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import heapq
 import hashlib
 import json
 import logging
@@ -108,6 +109,8 @@ class CurlError(RuntimeError):
 class RunConfig:
     retries: int = 4
     download_timeout: int = 3600
+    listing_retries: int = 3
+    listing_retry_delay: float = 5.0
     min_free_bytes: int = 1 << 30  # keep at least 1 GiB free
     manifest_save_every: int = 200
     content_order: str = "newest"
@@ -310,7 +313,7 @@ def _pid_alive(pid: int) -> bool:
 # open at once (crawl + download workers combined easily exceed a dozen).
 # Cap concurrent requests per host to avoid connection-timeout errors that
 # silently drop whole subfolders from the crawl.
-HOST_CONCURRENCY_LIMITS = {"media.defcon.org": 6}
+HOST_CONCURRENCY_LIMITS = {"infocon.org": 4, "media.defcon.org": 6}
 _host_semaphores: dict[str, threading.Semaphore] = {}
 _host_semaphores_lock = threading.Lock()
 
@@ -879,6 +882,7 @@ def scan_infocon_tree(
     dest_root: str,
     stop_requested: threading.Event | None = None,
     stats: "ProgressStats | None" = None,
+    listing_retry_delay: float | None = None,
 ) -> tuple[list[RemoteFile], list[dict]]:
     """Single-pass recursive scan over infocon.org roots.
 
@@ -896,38 +900,74 @@ def scan_infocon_tree(
     torrent_candidates: list[dict] = []
     directories_scanned = 0
     listing_errors = 0
+    scheduled_retries = 0
     last_progress = time.time()
     scan_started = time.time()
+    retry_delay = RUN.listing_retry_delay if listing_retry_delay is None else max(0.0, listing_retry_delay)
 
     http_url_set = {url for url, _ in http_roots}
 
     with ThreadPoolExecutor(max_workers=max(1, crawl_workers)) as pool:
-        # (future) -> (url, rel, is_http_eligible)
+        # (future) -> (url, rel, is_http_eligible, failed_attempts)
         pending: dict = {}
+        retry_queue: list[tuple[float, int, str, str, bool, int]] = []
+        retry_sequence = 0
+
+        def submit_listing(url: str, rel: str, is_http: bool, failed_attempts: int) -> None:
+            pending[pool.submit(list_directory, url)] = (url, rel, is_http, failed_attempts)
+
         for url, rel in http_roots:
-            pending[pool.submit(list_directory, url)] = (url, rel, True)
+            submit_listing(url, rel, True, 0)
         for url, rel in extra_torrent_roots:
             if url not in http_url_set:
-                pending[pool.submit(list_directory, url)] = (url, rel, False)
+                submit_listing(url, rel, False, 0)
 
-        while pending:
+        while pending or retry_queue:
             if stop_requested and stop_requested.is_set():
                 break
-            done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+            now = time.time()
+            while retry_queue and retry_queue[0][0] <= now:
+                _, _, url, rel, is_http, failed_attempts = heapq.heappop(retry_queue)
+                submit_listing(url, rel, is_http, failed_attempts)
+            if not pending:
+                time.sleep(min(0.25, max(0.0, retry_queue[0][0] - time.time())))
+                continue
+
+            retry_wait = None
+            if retry_queue:
+                retry_wait = max(0.0, retry_queue[0][0] - time.time())
+            done, _ = wait(list(pending.keys()), timeout=retry_wait, return_when=FIRST_COMPLETED)
             for fut in done:
-                url, rel, is_http = pending.pop(fut)
+                url, rel, is_http, failed_attempts = pending.pop(fut)
                 try:
                     entries = fut.result()
                 except Exception as exc:  # noqa: BLE001
-                    listing_errors += 1
-                    log.error("Failed to list %s during shared inventory scan: %s", url, exc)
+                    if failed_attempts < RUN.listing_retries:
+                        failed_attempts += 1
+                        delay = retry_delay * (2 ** (failed_attempts - 1))
+                        retry_sequence += 1
+                        heapq.heappush(
+                            retry_queue,
+                            (time.time() + delay, retry_sequence, url, rel, is_http, failed_attempts),
+                        )
+                        scheduled_retries += 1
+                        log.warning(
+                            "Directory listing failed for %s; retry %d/%d in %.1fs: %s",
+                            url, failed_attempts, RUN.listing_retries, delay, exc,
+                        )
+                    else:
+                        listing_errors += 1
+                        log.error(
+                            "Failed to list %s during shared inventory scan after %d retries: %s",
+                            url, RUN.listing_retries, exc,
+                        )
                     continue
                 directories_scanned += 1
                 for entry in entries:
                     child_url = urljoin(url, entry["href"])
                     child_rel = os.path.join(rel, entry["name"]) if rel else entry["name"]
                     if entry["is_dir"]:
-                        pending[pool.submit(list_directory, child_url)] = (child_url, child_rel, is_http)
+                        submit_listing(child_url, child_rel, is_http, 0)
                     elif entry["name"].lower().endswith(".torrent"):
                         torrent_candidates.append({
                             "url": child_url,
@@ -943,14 +983,15 @@ def scan_infocon_tree(
                 if now - last_progress >= 10:
                     last_progress = now
                     log.info(
-                        "Shared inventory progress: %d directories scanned, %d pending, %d HTTP files, %d torrent candidates, %d errors, %s elapsed",
-                        directories_scanned, len(pending), len(http_files), len(torrent_candidates),
-                        listing_errors, format_duration(now - scan_started),
+                        "Shared inventory progress: %d directories scanned, %d pending, %d retrying, %d HTTP files, %d torrent candidates, %d retries, %d errors, %s elapsed",
+                        directories_scanned, len(pending), len(retry_queue), len(http_files), len(torrent_candidates),
+                        scheduled_retries, listing_errors, format_duration(now - scan_started),
                     )
 
     log.info(
-        "Shared infocon.org scan complete: %d HTTP files, %d torrent candidates across %d root(s).",
+        "Shared infocon.org scan complete: %d HTTP files, %d torrent candidates across %d root(s); %d retries, %d errors.",
         len(http_files), len(torrent_candidates), len(http_roots) + len(extra_torrent_roots),
+        scheduled_retries, listing_errors,
     )
     return http_files, torrent_candidates
 
@@ -1062,6 +1103,10 @@ def main() -> int:
                          help="Per-file download attempts before giving up (default: 4)")
     parser.add_argument("--download-timeout", type=int, default=3600,
                          help="Max seconds for a single file download attempt (default: 3600)")
+    parser.add_argument("--listing-retries", type=int, default=3,
+                        help="Additional directory-listing retries after curl gives up (default: 3)")
+    parser.add_argument("--listing-retry-delay", type=float, default=5.0,
+                        help="Base seconds for exponential directory-listing retry backoff (default: 5)")
     parser.add_argument("--min-free-gib", type=int, default=1,
                          help="Refuse a download that would leave less than this many GiB free (default: 1)")
     parser.add_argument("--force", action="store_true",
@@ -1143,6 +1188,8 @@ def main() -> int:
 
     RUN.retries = max(1, args.retries)
     RUN.download_timeout = max(1, args.download_timeout)
+    RUN.listing_retries = max(0, args.listing_retries)
+    RUN.listing_retry_delay = max(0.0, args.listing_retry_delay)
     RUN.min_free_bytes = max(0, args.min_free_gib) * (1 << 30)
     RUN.content_order = args.content_order
 

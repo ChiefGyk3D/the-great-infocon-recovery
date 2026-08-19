@@ -171,7 +171,8 @@ class TestScanInfoconTree(unittest.TestCase):
                 raise RuntimeError("simulated network error")
             return [_dir_entry("file.pdf", is_dir=False)]
 
-        with patch.object(infocon_scraper, "list_directory", side_effect=fake_list):
+        with patch.object(infocon_scraper, "list_directory", side_effect=fake_list), \
+            patch.object(infocon_scraper.RUN, "listing_retries", 0):
             http_files, _ = scan_infocon_tree(
                 [("https://infocon.org/bad/", "bad"),
                  ("https://infocon.org/good/", "good")],
@@ -180,6 +181,27 @@ class TestScanInfoconTree(unittest.TestCase):
             )
         rel_paths = [f.rel_path for f in http_files]
         self.assertIn(os.path.join("good", "file.pdf"), rel_paths)
+
+    def test_listing_error_is_retried(self):
+        """A transient directory-listing failure is retried before being abandoned."""
+        attempts = 0
+
+        def fake_list(url: str) -> list[dict]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient timeout")
+            return [_dir_entry("file.pdf", is_dir=False)]
+
+        with patch.object(infocon_scraper, "list_directory", side_effect=fake_list), \
+                patch.object(infocon_scraper.RUN, "listing_retries", 1):
+            http_files, _ = scan_infocon_tree(
+                [("https://infocon.org/retry/", "retry")], [],
+                crawl_workers=1, dest_root="/dest", listing_retry_delay=0,
+            )
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual([item.rel_path for item in http_files], [os.path.join("retry", "file.pdf")])
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +285,35 @@ class TestMergeInfoconCandidates(unittest.TestCase):
         self.assertEqual(len(result), 1)
         # v1 beats versionless (0)
         self.assertIn("v1", result[0].url)
+
+
+class TestTorrentDiscoveryRetry(unittest.TestCase):
+
+    def test_transient_listing_error_is_retried_without_marking_visited(self):
+        from fetch_defcon_torrents import TorrentSettings, discover_torrents_recursive
+
+        settings = TorrentSettings(
+            max_active=1, connections=1, listen_interface="0.0.0.0:6881",
+            poll_seconds=1, seed_time=0, enable_dht=False, enable_pex=False,
+            enable_lsd=False, request_timeout=30, retries=0, retry_delay=0,
+            discovery_retries=1, discovery_retry_delay=0,
+        )
+        attempts = 0
+
+        def fake_curl_text(url: str, settings: object, timeout: int | None = None) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient timeout")
+            return '<table id="list"><tbody><tr><td><a href="Example.torrent">Example.torrent</a></td></tr></tbody></table>'
+
+        with patch("fetch_defcon_torrents.curl_text", side_effect=fake_curl_text):
+            specs = discover_torrents_recursive(
+                [("https://infocon.org/retry/", "/dest")], settings,
+            )
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual([spec.name for spec in specs], ["Example"])
 
 
 # ---------------------------------------------------------------------------
