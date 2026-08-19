@@ -281,7 +281,13 @@ python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
   --listen-interface "0.0.0.0:51413"
 ```
 
-The default torrent status output reports the total rate, number of active torrents, and queued/idle torrents. A torrent showing zero peers can be queued by libtorrent or temporarily have no available peers; it is not automatically an error.
+The default torrent status output reports the total rate, number of active torrents, queued/idle torrents, and how many are not yet admitted to the session. A torrent showing zero peers can be queued by libtorrent or temporarily have no available peers; it is not automatically an error.
+
+Per-torrent detail lines are capped at `--status-lines` (default 10, `--torrent-status-lines` in combined mode) and the remainder is summarised by state. Printing every incomplete torrent each poll produced thousands of log lines a minute on a large set.
+
+Torrents are admitted to the session a window at a time rather than all at once, so a large set does not hash-check every archive simultaneously against one disk.
+
+Fast-resume data is checkpointed every `--resume-save-minutes` (default 5) and again on exit, including after `Ctrl+C`. Without it every restart re-hash-checks the entire set - terabytes on a populated drive - before anything can transfer. Checkpoints live under the torrent cache directory, so relocating the cache with `--torrents-dir` or `INFOCON_TORRENTS_CACHE` moves them too.
 
 ### Combined Torrent and HTTP Mode
 
@@ -386,7 +392,8 @@ The HTTP sync is built to survive interruptions and large runs:
 - **Periodic manifest saves.** The verification manifest is flushed every 200 completions, so a crash or power loss keeps most hash progress. Size and modification time are recorded as soon as a download lands, before its hash is computed, so an interrupted run still keeps the fast path.
 - **Cheap refreshes.** A file whose local size and the listing's published modification time both match the manifest is skipped without any network request. Only files that look changed, unknown, or `--verify-all` cost a HEAD.
 - **Single-instance lock.** A `.infocon_scraper.lock` PID file under the destination prevents two syncs from racing on the same drive. Stale locks (dead PID) are reclaimed automatically; override with `--force`.
-- **Signal handling.** `SIGINT`/`SIGTERM` finish in-flight downloads, save the manifest, and release the lock.
+- **Signal handling.** `SIGINT`/`SIGTERM` finish in-flight downloads, save the manifest, checkpoint torrent fast-resume data, and release the lock. The torrent phase runs on its own thread and is stopped through the same signal, rather than being left running while shutdown waits on it.
+- **Honest progress.** The reported rate and totals include bytes staged by transfers still in flight, so a run pulling several multi-gigabyte archives shows real throughput instead of `0 B/s` until the first one lands.
 - **Corruption detection.** A local file whose recorded hash no longer matches is re-downloaded.
 - **Untrusted listing names.** A directory entry whose name is not a single path segment - absolute, or containing a separator or `..` - is ignored instead of being joined onto the destination path.
 

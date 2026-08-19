@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Callable
@@ -111,6 +112,13 @@ class TorrentSettings:
     torrent_order: str = "newest"
     discovery_retries: int = 3
     discovery_retry_delay: float = 5.0
+    # Per-torrent detail lines printed each poll. The status block used to list
+    # every incomplete torrent every cycle: at 293 torrents on a 10s poll that
+    # is ~2,500 log lines a minute, and it dominated the run log.
+    status_lines: int = 10
+    # Minutes between resume-data checkpoints. Without resume data every restart
+    # re-hash-checks the whole set before a single byte can transfer.
+    resume_save_minutes: int = 5
 
 
 @dataclass(frozen=True)
@@ -134,6 +142,13 @@ def build_libtorrent_session(settings: TorrentSettings) -> lt.session:
     session_settings["active_seeds"] = limit
     session_settings["active_limit"] = limit
     session_settings["connections_limit"] = settings.connections
+    # Resume-data checkpoints arrive as alerts, so the storage category has to
+    # be enabled for them to be delivered at all.
+    if "alert_mask" in session_settings:
+        session_settings["alert_mask"] = int(
+            lt.alert.category_t.status_notification | lt.alert.category_t.storage_notification
+            | lt.alert.category_t.error_notification
+        )
 
     if "enable_dht" in session_settings:
         session_settings["enable_dht"] = bool(settings.enable_dht)
@@ -452,6 +467,93 @@ def _wants_to_download(name: str, status, selected_names: set[str]) -> bool:
     return not _status_is_paused(status)
 
 
+def resume_file_path(resume_dir: str, spec: TorrentSpec) -> str:
+    """Where a torrent's fast-resume checkpoint lives."""
+    key = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{spec.save_path}_{spec.name}")
+    return os.path.join(resume_dir, f"{key}.resume")
+
+
+def load_add_params(spec: TorrentSpec, info, resume_dir: str):
+    """add_torrent_params for *spec*, reusing fast-resume data when present.
+
+    Resume data is what lets a restart skip re-hashing content that was already
+    verified. Without it every run re-checks the full set - terabytes on a
+    populated drive - before it can transfer anything.
+    """
+    path = resume_file_path(resume_dir, spec)
+    try:
+        with open(path, "rb") as stream:
+            atp = lt.read_resume_data(stream.read())
+    except (FileNotFoundError, OSError, RuntimeError) as exc:
+        if not isinstance(exc, FileNotFoundError):
+            print(f"Ignoring unusable resume data for {spec.name}: {exc}")
+        atp = lt.add_torrent_params()
+    atp.ti = info
+    atp.save_path = spec.save_path
+    return atp
+
+
+def handle_key(handle) -> str:
+    """Stable identity for a torrent handle, used to route resume alerts.
+
+    The alert only carries the torrent's own internal name, which is not the
+    label we track it under, so the info hash is what ties an alert back to the
+    file it should be written to.
+    """
+    try:
+        return str(handle.info_hash())
+    except RuntimeError:
+        return ""
+
+
+def save_resume_alerts(session, resume_targets: dict[str, str]) -> int:
+    """Persist resume-data alerts the session has produced. Returns a count."""
+    saved = 0
+    for alert in session.pop_alerts():
+        if isinstance(alert, lt.save_resume_data_alert):
+            path = resume_targets.get(handle_key(alert.handle))
+            if not path:
+                continue
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                temporary = path + ".tmp"
+                with open(temporary, "wb") as stream:
+                    stream.write(lt.write_resume_data_buf(alert.params))
+                os.replace(temporary, path)
+                saved += 1
+            except OSError as exc:
+                print(f"Could not write resume data to {path}: {exc}")
+        elif isinstance(alert, lt.save_resume_data_failed_alert):
+            # Routine: libtorrent declines when nothing changed since last save.
+            pass
+    return saved
+
+
+def checkpoint_before_exit(session, handles: dict, resume_targets: dict[str, str],
+                           request: Callable[[], None], timeout: float = 30.0) -> None:
+    """Flush fast-resume data for every torrent before the process exits.
+
+    Skipping this is what made a restart re-hash the whole set, so it is worth
+    a bounded wait even on an interrupted run.
+    """
+    if not handles:
+        return
+    for handle in handles.values():
+        try:
+            handle.pause()
+        except RuntimeError:
+            continue
+    request()
+    deadline = time.time() + timeout
+    saved = 0
+    while time.time() < deadline and saved < len(handles):
+        saved += save_resume_alerts(session, resume_targets)
+        if saved >= len(handles):
+            break
+        time.sleep(0.2)
+    print(f"Checkpointed fast-resume data for {saved} of {len(handles)} torrent(s).")
+
+
 def torrent_priority(name: str) -> tuple[int, int, str]:
     """Sort numbered DEF CON archives newest first, then non-numbered items."""
     match = re.search(r"\b(?:DEF CON|DC)\s+(\d+)\b", name, re.IGNORECASE)
@@ -556,7 +658,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               index_path: str | None = None,
               index_ttl_hours: int = 168,
               checkpoint_path: str | None = None,
-              infocon_candidates: list[dict] | None = None) -> int:
+              infocon_candidates: list[dict] | None = None,
+              stop_event: threading.Event | None = None) -> int:
     """Discover and download torrents.
 
     When *infocon_candidates* is supplied (from scan_infocon_tree in
@@ -636,30 +739,69 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     # handed to HTTP within `stalled_minutes` of checking finishing.
     selected_names: set[str] = set()
 
-    for spec in sorted(available, key=lambda item: torrent_order_key(item.name, settings.torrent_order)):
-        name = spec.name
-        torrent_url = spec.url
-        cache_name = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{spec.save_path}_{name}")
-        torrent_path = os.path.join(torrents_dir, f"{cache_name}.torrent")
-        if not os.path.exists(torrent_path):
-            print(f"Fetching torrent metadata for {name} ...")
-            curl_download(torrent_url, torrent_path, settings)
-        try:
-            info = lt.torrent_info(torrent_path)
-        except RuntimeError as exc:
-            print(f"Skipping {name}: could not load torrent ({exc})")
-            continue
-        atp = lt.add_torrent_params()
-        atp.ti = info
-        atp.save_path = spec.save_path
-        h = ses.add_torrent(atp)
-        handles[name] = h
-        print(f"Added {name}: {info.total_size() / 1e9:.2f} GB, {info.num_files()} files")
+    resume_dir = os.path.join(torrents_dir, "resume")
+    resume_targets: dict[str, str] = {}
+    queued_specs = deque(sorted(available,
+                                key=lambda item: torrent_order_key(item.name, settings.torrent_order)))
+    total_specs = len(queued_specs)
+    skipped_specs = 0
+    # Every torrent added at once means every torrent hash-checks at once. On a
+    # populated multi-terabyte drive that is a self-inflicted disk storm before
+    # any transfer can start, so torrents are admitted a window at a time.
+    add_window = max(4, (settings.max_active if settings.max_active > 0 else 8) * 2)
 
+    def add_next_torrent() -> bool:
+        nonlocal skipped_specs
+        while queued_specs:
+            spec = queued_specs.popleft()
+            cache_name = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{spec.save_path}_{spec.name}")
+            torrent_path = os.path.join(torrents_dir, f"{cache_name}.torrent")
+            if not os.path.exists(torrent_path):
+                print(f"Fetching torrent metadata for {spec.name} ...")
+                try:
+                    curl_download(spec.url, torrent_path, settings)
+                except RuntimeError as exc:
+                    print(f"Skipping {spec.name}: could not fetch torrent ({exc})")
+                    skipped_specs += 1
+                    continue
+            try:
+                info = lt.torrent_info(torrent_path)
+            except RuntimeError as exc:
+                print(f"Skipping {spec.name}: could not load torrent ({exc})")
+                skipped_specs += 1
+                continue
+            handle = ses.add_torrent(load_add_params(spec, info, resume_dir))
+            handles[spec.name] = handle
+            resume_targets[handle_key(handle)] = resume_file_path(resume_dir, spec)
+            resumed = os.path.exists(resume_file_path(resume_dir, spec))
+            print(f"Added {spec.name}: {info.total_size() / 1e9:.2f} GB, {info.num_files()} files"
+                  f"{' (fast resume)' if resumed else ''}")
+            return True
+        return False
+
+    def top_up_torrents(finished: set[str]) -> None:
+        """Keep a bounded window of torrents admitted to the session."""
+        while queued_specs and len(handles) - len(finished) < add_window:
+            if not add_next_torrent():
+                break
+
+    def request_resume_checkpoints() -> None:
+        for name, handle in handles.items():
+            if name in stalled_names:
+                continue
+            try:
+                if handle.is_valid() and handle.status().has_metadata:
+                    handle.save_resume_data(lt.save_resume_flags_t.only_if_modified)
+            except RuntimeError:
+                continue
+
+    top_up_torrents(set())
+    print(f"Admitted {len(handles)} of {total_specs} torrent(s); the rest join as slots free up.")
     print("Verifying/downloading... (Ctrl+C to stop; already-correct files are skipped automatically)")
     try:
         checking_complete = False
         scheduler_locked = False
+        last_resume_request = time.time()
         while True:
             done = 0
             active = []
@@ -735,26 +877,55 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                         no_activity_since.pop(name, None)
             total_rate = sum(a[0] for a in active)
             downloading = sum(1 for a in active if a[0] > 0)
-            print(f"--- {done}/{len(handles)} complete | {total_rate / 1e6:6.2f} MB/s total | "
-                  f"{downloading} active, {len(active) - downloading} queued/idle ---")
-            for rate, progress, peers, state, name in active:
+            waiting = len(queued_specs)
+            print(f"--- {done}/{total_specs - skipped_specs} complete | {total_rate / 1e6:6.2f} MB/s total | "
+                  f"{downloading} active, {len(active) - downloading} queued/idle, "
+                  f"{waiting} not yet admitted ---")
+            # Detail lines are capped: printing every incomplete torrent each
+            # poll produced thousands of log lines a minute and buried
+            # everything else in the run log.
+            shown = active[:max(0, settings.status_lines)]
+            for rate, progress, peers, state, name in shown:
                 print(f"{name}: {progress * 100:5.1f}%  down {rate / 1e6:6.2f} MB/s  "
                       f"peers {peers}  state {state}")
+            if len(active) > len(shown):
+                states: dict[str, int] = {}
+                for _, _, _, state, _ in active[len(shown):]:
+                    states[state] = states.get(state, 0) + 1
+                summary = ", ".join(f"{count} {state}" for state, count in sorted(states.items()))
+                print(f"... and {len(active) - len(shown)} more ({summary})")
+
             if ready_event is not None and not checking_complete and not checking:
                 checking_complete = True
                 print("Initial torrent file checking complete; HTTP sync may proceed in parallel.")
                 ready_event.set()
+
+            finished_names = {name for name in handles if name in completed_at} | stalled_names
+            top_up_torrents(finished_names)
+
+            saved = save_resume_alerts(ses, resume_targets)
+            if saved:
+                print(f"Saved fast-resume data for {saved} torrent(s).")
+            if time.time() - last_resume_request >= settings.resume_save_minutes * 60:
+                last_resume_request = time.time()
+                request_resume_checkpoints()
+
             target_count = len(handles) - len(stalled_names)
-            if done == target_count:
+            if done == target_count and not queued_specs:
                 print("All requested DEF CON items fully downloaded and verified.")
+                break
+            if stop_event is not None and stop_event.is_set():
+                print("Stop requested; pausing torrents and checkpointing resume data.")
                 break
             time.sleep(settings.poll_seconds)
     except KeyboardInterrupt:
         print("Interrupted - already-verified pieces are safe; re-run to resume/continue.")
+        checkpoint_before_exit(ses, handles, resume_targets, request_resume_checkpoints)
         return 1
     finally:
         if ready_event is not None and not ready_event.is_set():
             ready_event.set()
+    checkpoint_before_exit(ses, handles, resume_targets, request_resume_checkpoints)
     return 0
 
 
@@ -800,6 +971,12 @@ def main() -> int:
                          help="Listening address and port, e.g. 0.0.0.0:6881 or 192.0.2.10:51413")
     parser.add_argument("--poll-seconds", type=int, default=10,
                          help="Progress reporting interval (default: 10)")
+    parser.add_argument("--status-lines", type=int, default=10,
+                        help="Per-torrent detail lines printed each poll; the rest are summarised "
+                             "(default: 10)")
+    parser.add_argument("--resume-save-minutes", type=int, default=5,
+                        help="Minutes between fast-resume checkpoints, which let a restart skip "
+                             "re-hashing verified content (default: 5)")
     parser.add_argument("--seed-time", type=int, default=0,
                          help="Minutes to seed after completion; 0 disables seeding")
     parser.add_argument("--stalled-minutes", type=int, default=30,
@@ -839,6 +1016,8 @@ def main() -> int:
         discovery_workers=max(1, args.discovery_workers),
         max_defcon_active=max(0, args.max_defcon_active),
         torrent_order=args.torrent_order,
+        status_lines=max(0, args.status_lines),
+        resume_save_minutes=max(1, args.resume_save_minutes),
     )
     return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip,
                      include_mirrors=args.include_mirrors,
