@@ -16,5 +16,8 @@ infocon-monitor.out.tmp.*
 *.log
 *.torrent
 .infocon_manifest.json
+.infocon_manifest.db
+.infocon_manifest.db-wal
+.infocon_manifest.db-shm
 *.part
 .infocon_scraper.lock

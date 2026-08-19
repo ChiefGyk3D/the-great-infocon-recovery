@@ -29,6 +29,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import infocon_scraper
 from infocon_scraper import RemoteFile, resolve_stalled_fallback_root, root_is_covered
+try:
+    import libtorrent  # noqa: F401  - the torrent helper imports it at module level
+except ImportError as exc:  # pragma: no cover - CI without prebuilt wheels
+    raise unittest.SkipTest(f"libtorrent unavailable: {exc}") from exc
+
 from fetch_defcon_torrents import (
     TorrentSpec,
     _status_is_paused,
@@ -259,7 +264,7 @@ class TestPathClaims(unittest.TestCase):
 
         def worker():
             result, _ = infocon_scraper.sync_file(
-                item, "/mnt/archive", infocon_scraper.Manifest("/nonexistent/manifest.json"),
+                item, "/mnt/archive", infocon_scraper.Manifest(":memory:"),
                 verify_all=False, dry_run=False,
             )
             with results_lock:

@@ -37,7 +37,7 @@ import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from typing import Callable
+from collections.abc import Callable
 from urllib.parse import unquote, urljoin
 
 import libtorrent as lt
@@ -74,7 +74,7 @@ def acquire_lock(lock_path: str, force: bool = False) -> bool:
     """Create an exclusive PID lock on the drive root. Returns False if another active sync holds it."""
     if os.path.exists(lock_path):
         try:
-            with open(lock_path, "r", encoding="utf-8") as f:
+            with open(lock_path, encoding="utf-8") as f:
                 text = f.read().strip()
             pid = int(text) if text else 0
         except (ValueError, OSError):
@@ -257,7 +257,7 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                    "include_rainbow_tables": include_rainbow_tables}
     if checkpoint_path:
         try:
-            with open(checkpoint_path, "r", encoding="utf-8") as stream:
+            with open(checkpoint_path, encoding="utf-8") as stream:
                 checkpoint = json.load(stream)
             if checkpoint.get("fingerprint") == fingerprint:
                 visited = set(checkpoint.get("visited", []))
@@ -408,7 +408,7 @@ def discover_torrents_indexed(roots: list[tuple[str, str]], settings: TorrentSet
         "include_rainbow_tables": include_rainbow_tables,
     }
     try:
-        with open(index_path, "r", encoding="utf-8") as stream:
+        with open(index_path, encoding="utf-8") as stream:
             cached = json.load(stream)
         age_hours = (time.time() - float(cached["scanned_at"])) / 3600
         if age_hours <= index_ttl_hours and cached.get("fingerprint") == fingerprint:
@@ -823,9 +823,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                 ):
                     done += 1
                     completed_at.setdefault(name, time.time())
-                    if settings.seed_time == 0 and s.state != lt.torrent_status.paused:
-                        h.pause()
-                    elif settings.seed_time > 0 and time.time() - completed_at[name] >= settings.seed_time * 60:
+                    if settings.seed_time == 0 and s.state != lt.torrent_status.paused or settings.seed_time > 0 and time.time() - completed_at[name] >= settings.seed_time * 60:
                         h.pause()
                 else:
                     if not _wants_to_download(name, s, selected_names):

@@ -21,13 +21,17 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import infocon_scraper
+try:
+    import libtorrent  # noqa: F401  - the torrent helper imports it at module level
+except ImportError as exc:  # pragma: no cover - CI without prebuilt wheels
+    raise unittest.SkipTest(f"libtorrent unavailable: {exc}") from exc
+
 import fetch_defcon_torrents
 from fetch_defcon_torrents import (
     TorrentSpec,

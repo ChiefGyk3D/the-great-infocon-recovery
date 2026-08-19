@@ -52,13 +52,14 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import signal
 import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
-from typing import Callable
+from collections.abc import Callable
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -329,7 +330,8 @@ def acquire_lock(lock_path: str, force: bool = False) -> bool:
     A stale lock (owning PID no longer running) is reclaimed automatically."""
     if os.path.exists(lock_path):
         try:
-            existing_pid = int(open(lock_path, encoding="utf-8").read().strip() or "0")
+            with open(lock_path, encoding="utf-8") as handle:
+                existing_pid = int(handle.read().strip() or "0")
         except (OSError, ValueError):
             existing_pid = 0
         if existing_pid and _pid_alive(existing_pid) and not force:
@@ -346,10 +348,12 @@ def acquire_lock(lock_path: str, force: bool = False) -> bool:
 
 def release_lock(lock_path: str) -> None:
     try:
-        if os.path.exists(lock_path) and open(lock_path, encoding="utf-8").read().strip() == str(os.getpid()):
-            _safe_remove(lock_path)
+        with open(lock_path, encoding="utf-8") as handle:
+            owner = handle.read().strip()
     except OSError:
-        pass
+        return
+    if owner == str(os.getpid()):
+        _safe_remove(lock_path)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -467,7 +471,6 @@ def download_atomic(url: str, local_path: str, remote_size: int | None) -> None:
     looks complete. Resumes an existing .part when the server supports it, and
     retries with backoff on failure or size mismatch."""
     part = local_path + ".part"
-    last_err: str | None = None
     register_part(part, os.path.getsize(part) if os.path.exists(part) else 0)
     try:
         _download_attempts(url, local_path, remote_size, part)
@@ -699,11 +702,11 @@ def is_large_transfer(item: RemoteFile) -> bool:
     return bool(item.size and item.size >= RUN.large_file_bytes)
 
 
-def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest", crawl_workers: int,
+def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: Manifest, crawl_workers: int,
              download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event,
              initial_files: list[RemoteFile] | None = None,
              max_pending_downloads: int | None = None,
-             stats: "ProgressStats | None" = None,
+             stats: ProgressStats | None = None,
              skip_paths: list[str] | None = None,
              initial_files_already_counted: bool = False) -> dict[str, int]:
     """Crawl and download at the same time: as soon as a file is discovered it's
@@ -752,8 +755,14 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
             return ready_small.popleft()
         return None
 
-    with ThreadPoolExecutor(max_workers=crawl_workers) as crawl_pool, \
-            ThreadPoolExecutor(max_workers=download_workers) as dl_pool:
+    # Not a `with` block: exiting one calls shutdown(wait=True), which drains
+    # every *queued* task before returning. On a stop signal mid-crawl that
+    # means waiting out the entire remaining directory queue - a SIGTERM took
+    # minutes to be honoured instead of seconds. Queued work is cancelled
+    # explicitly instead; tasks already running still finish.
+    crawl_pool = ThreadPoolExecutor(max_workers=crawl_workers, thread_name_prefix="crawl")
+    dl_pool = ThreadPoolExecutor(max_workers=download_workers, thread_name_prefix="download")
+    try:
         pending: dict = {}
         # Listings that finished while the download queue was full. They are
         # parked here rather than left in `pending`, where an already-completed
@@ -850,6 +859,15 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
                 if completed % RUN.manifest_save_every == 0 and not dry_run:
                     manifest.save()
 
+    finally:
+        cancelled = stop_requested.is_set()
+        crawl_pool.shutdown(wait=True, cancel_futures=cancelled)
+        dl_pool.shutdown(wait=True, cancel_futures=cancelled)
+        # Persist whatever this pass recorded, rather than leaving it buffered
+        # until the next 200-completion checkpoint that may never arrive.
+        if not dry_run:
+            manifest.save()
+
     log.info("Progress: %d files completed (%d discovered total)", completed, discovered)
     return counts
 
@@ -862,36 +880,123 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+MANIFEST_FLUSH_EVERY = 500
+MANIFEST_COLUMNS = ("size", "sha256", "url", "mtime", "verified")
+
+
+def manifest_db_path(path: str) -> str:
+    """Storage path for the manifest, given whatever the user asked for."""
+    if path == ":memory:":
+        return path
+    return path[:-5] + ".db" if path.endswith(".json") else path
+
+
 class Manifest:
+    """Verification records for every synced file, stored in SQLite.
+
+    This used to be one JSON document held entirely in memory and rewritten in
+    full every 200 completions. Across the archive's ~450k files that means
+    serialising tens of megabytes thousands of times - and doing it under the
+    same lock every worker needs to read through, so the entire pool stalled on
+    each save. SQLite in WAL mode writes only what changed and never blocks
+    readers behind a full rewrite.
+
+    An existing .infocon_manifest.json is imported once on first use, so an
+    established drive keeps every hash it has already recorded.
+    """
+
     def __init__(self, path: str):
-        self.path = path
-        self.lock = threading.Lock()
-        self.data: dict[str, dict] = {}
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.data = json.load(f)
-            except (json.JSONDecodeError, OSError) as exc:
-                log.warning("Could not read manifest %s (%s), starting fresh", path, exc)
+        self.path = manifest_db_path(path)
+        self.lock = threading.RLock()
+        self._pending: dict[str, dict] = {}
+        if self.path != ":memory:":
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        with self.lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS entries ("
+                "rel TEXT PRIMARY KEY, size INTEGER, sha256 TEXT, url TEXT, "
+                "mtime REAL, verified REAL)"
+            )
+            self._conn.commit()
+        self._import_legacy(path)
+
+    def _import_legacy(self, requested_path: str) -> None:
+        """Load a pre-SQLite JSON manifest exactly once."""
+        if self.path == ":memory:":
+            return
+        legacy = requested_path if requested_path.endswith(".json") else self.path[:-3] + ".json"
+        if not os.path.exists(legacy):
+            return
+        with self.lock:
+            existing = self._conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        if existing:
+            return
+        try:
+            with open(legacy, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("Could not read legacy manifest %s (%s), starting fresh", legacy, exc)
+            return
+        if not isinstance(data, dict) or not data:
+            return
+        log.info("Importing %d entries from the legacy JSON manifest %s ...", len(data), legacy)
+        for rel, entry in data.items():
+            if isinstance(entry, dict):
+                self._pending[rel] = entry
+        self.save()
+        log.info("Manifest migrated to %s; the JSON copy is no longer read or updated.", self.path)
 
     def get(self, rel_path: str) -> dict | None:
         with self.lock:
-            return self.data.get(rel_path)
+            if rel_path in self._pending:
+                return dict(self._pending[rel_path])
+            row = self._conn.execute(
+                f"SELECT {', '.join(MANIFEST_COLUMNS)} FROM entries WHERE rel = ?", (rel_path,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {name: value for name, value in zip(MANIFEST_COLUMNS, row, strict=True)
+                if value is not None}
 
     def set(self, rel_path: str, entry: dict) -> None:
         with self.lock:
-            self.data[rel_path] = entry
+            self._pending[rel_path] = entry
+            overflowing = len(self._pending) >= MANIFEST_FLUSH_EVERY
+        if overflowing:
+            self.save()
 
     def save(self) -> None:
+        """Flush buffered entries. Cheap and incremental, unlike a full rewrite."""
         with self.lock:
-            tmp = self.path + ".tmp"
-            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2, sort_keys=True)
-            os.replace(tmp, self.path)
+            if not self._pending:
+                return
+            rows = [
+                (rel,) + tuple(entry.get(name) for name in MANIFEST_COLUMNS)
+                for rel, entry in self._pending.items()
+            ]
+            self._pending.clear()
+            self._conn.executemany(
+                f"INSERT OR REPLACE INTO entries (rel, {', '.join(MANIFEST_COLUMNS)}) "
+                f"VALUES (?{', ?' * len(MANIFEST_COLUMNS)})",
+                rows,
+            )
+            self._conn.commit()
+
+    def count(self) -> int:
+        self.save()
+        with self.lock:
+            return self._conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+
+    def close(self) -> None:
+        self.save()
+        with self.lock:
+            self._conn.close()
 
 
-def _record(manifest: "Manifest", rel: str, item: "RemoteFile", size: int,
+def _record(manifest: Manifest, rel: str, item: RemoteFile, size: int,
             digest: str | None) -> None:
     """Write a manifest entry, preserving a known hash when none is supplied."""
     entry = {
@@ -916,8 +1021,8 @@ _hash_futures: list = []
 _hash_lock = threading.Lock()
 
 
-def schedule_hash(manifest: "Manifest", rel: str, local_path: str,
-                  item: "RemoteFile", size: int) -> None:
+def schedule_hash(manifest: Manifest, rel: str, local_path: str,
+                  item: RemoteFile, size: int) -> None:
     global _hash_pool
 
     def run() -> None:
@@ -1343,7 +1448,7 @@ def scan_infocon_tree(
     crawl_workers: int,
     dest_root: str,
     stop_requested: threading.Event | None = None,
-    stats: "ProgressStats | None" = None,
+    stats: ProgressStats | None = None,
     listing_retry_delay: float | None = None,
 ) -> tuple[list[RemoteFile], list[dict]]:
     """Single-pass recursive scan over infocon.org roots.
@@ -1638,7 +1743,10 @@ def main() -> int:
                          help="Hours before online torrent inventory is rescanned (default: 168 / 7 days)")
     parser.add_argument("--torrent-discovery-checkpoint", default=None,
                          help="Resumable recursive torrent discovery checkpoint path")
-    parser.add_argument("--manifest", default=None, help="Path to manifest JSON (default: <dest>/.infocon_manifest.json)")
+    parser.add_argument("--manifest", default=None,
+                         help="Path to the verification manifest database "
+                              "(default: <dest>/.infocon_manifest.db). An existing "
+                              ".infocon_manifest.json from an earlier version is imported once.")
     parser.add_argument("--log-file", default=None, help="Path to log file (default: <dest>/infocon_scraper.log)")
     parser.add_argument("--list-torrents", metavar="NAME",
                          help="Instead of syncing, list available .torrent files under infocon.org/cons/ whose "
@@ -1668,7 +1776,7 @@ def main() -> int:
         download_dir = os.path.join(args.dest, "torrents-download", args.fetch_torrent)
         return run_aria2c_torrent(torrent_path, download_dir)
 
-    manifest_path = args.manifest or os.path.join(args.dest, ".infocon_manifest.json")
+    manifest_path = args.manifest or os.path.join(args.dest, ".infocon_manifest.db")
     log_file = args.log_file or os.path.join(args.dest, "infocon_scraper.log")
     os.makedirs(args.dest, exist_ok=True)
 
@@ -1914,7 +2022,7 @@ def main() -> int:
         if reporter:
             reporter.stop()
             reporter.join(timeout=args.status_interval + 2)
-        manifest.save()
+        manifest.close()
         release_lock(lock_path)
 
     for key, value in fallback_counts.items():
