@@ -10,6 +10,10 @@ MAX_IDLE_LINES=${INFOCON_TORRENT_MAX_IDLE_LINES:-10}
 while :; do
     clear
     printf 'InfoCon BitTorrent status  %s  refresh=%ss\n\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$INTERVAL"
+    latest_candidates=$(grep -E 'Eligible torrent candidates so far:' "$LOG" 2>/dev/null | tail -n 1 || true)
+    if [[ -n "$latest_candidates" ]]; then
+        printf '%s\n\n' "$latest_candidates"
+    fi
     awk -v max_idle="$MAX_IDLE_LINES" '
         /^--- [0-9]+\/[0-9]+ complete/ {
             summary=$0
