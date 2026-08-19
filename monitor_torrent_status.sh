@@ -22,7 +22,7 @@ while :; do
         }
         END {
             if (summary == "") {
-                print "No torrent status block found yet."
+                print "Torrent status is waiting for recursive discovery to finish."
                 exit
             }
             print summary

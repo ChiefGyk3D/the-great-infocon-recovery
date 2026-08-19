@@ -183,11 +183,14 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
     pending = list(roots)
     visited: set[str] = set()
     found: dict[str, tuple[int, TorrentSpec]] = {}
+    print(f"Recursive torrent discovery started across {len(roots)} root(s); mirrors={'included' if include_mirrors else 'excluded'}.")
     while pending:
         dir_url, save_path = pending.pop()
         if dir_url in visited:
             continue
         visited.add(dir_url)
+        if len(visited) % 100 == 0:
+            print(f"Torrent discovery: scanned {len(visited)} directories, found {len(found)} torrent candidates...")
         try:
             html = curl_text(dir_url, settings)
         except RuntimeError as exc:
@@ -210,7 +213,9 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
             previous = found.get(key)
             if previous is None or version > previous[0]:
                 found[key] = (version, candidate)
-    return sorted((spec for _, spec in found.values()), key=lambda spec: torrent_priority(spec.name))
+    specs = sorted((spec for _, spec in found.values()), key=lambda spec: torrent_priority(spec.name))
+    print(f"Recursive torrent discovery complete: scanned {len(visited)} directories, found {len(specs)} torrent files.")
+    return specs
 
 
 def torrent_priority(name: str) -> tuple[int, int, str]:
