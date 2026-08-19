@@ -38,7 +38,7 @@ DEFCON_LISTING = os.path.join(FIXTURES, "media_defcon_org_DEF_20CON_2030.html")
 
 
 def load(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+    with open(path, encoding="utf-8", errors="replace") as handle:
         return handle.read()
 
 

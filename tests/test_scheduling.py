@@ -137,7 +137,7 @@ class TestManifestFastPath(RunConfigGuard):
 
     def test_known_good_file_issues_no_network_request(self):
         """The refresh case: one request per file used to be spent to learn nothing."""
-        manifest = Manifest("/nonexistent/manifest.json")
+        manifest = Manifest(":memory:")
         manifest.set("cons/x.pdf", {"size": 1000, "mtime": 1_700_000_000.0, "sha256": "abc"})
         with patch("infocon_scraper.curl_head_size", side_effect=AssertionError("HEAD issued")), \
                 patch("infocon_scraper.os.path.exists", return_value=True), \
@@ -148,7 +148,7 @@ class TestManifestFastPath(RunConfigGuard):
         self.assertEqual(result, "skip-known-good")
 
     def test_verify_all_still_forces_the_network_check(self):
-        manifest = Manifest("/nonexistent/manifest.json")
+        manifest = Manifest(":memory:")
         manifest.set("cons/x.pdf", {"size": 1000, "mtime": 1_700_000_000.0, "sha256": "abc"})
         with patch("infocon_scraper.curl_head_size", return_value=1000) as head, \
                 patch("infocon_scraper.os.path.exists", return_value=True), \
@@ -206,7 +206,7 @@ class TestLargeTransferBudget(RunConfigGuard):
 
         with patch("infocon_scraper.sync_file", side_effect=fake_sync):
             unblock()
-            counts = run_sync([], "/mnt/archive", Manifest("/nonexistent/m.json"),
+            counts = run_sync([], "/mnt/archive", Manifest(":memory:"),
                               crawl_workers=2, download_workers=8, verify_all=False,
                               dry_run=False, stop_requested=threading.Event(),
                               initial_files=files, max_pending_downloads=8)
@@ -223,7 +223,7 @@ class TestLargeTransferBudget(RunConfigGuard):
                             rel_path=f"s{i}.txt", size=1024) for i in range(6)]
         with patch("infocon_scraper.sync_file",
                    side_effect=lambda *a, **k: ("downloaded", 1024)):
-            counts = run_sync([], "/mnt/archive", Manifest("/nonexistent/m.json"),
+            counts = run_sync([], "/mnt/archive", Manifest(":memory:"),
                               crawl_workers=2, download_workers=4, verify_all=False,
                               dry_run=False, stop_requested=threading.Event(),
                               initial_files=files, max_pending_downloads=8)
@@ -249,7 +249,7 @@ class TestPrebuiltFileList(RunConfigGuard):
         with patch("infocon_scraper.sync_file",
                    side_effect=lambda item, *a, **k: (synced.append(item.rel_path),
                                                       ("downloaded", 10))[1]):
-            counts = run_sync([], "/mnt/archive", Manifest("/nonexistent/m.json"),
+            counts = run_sync([], "/mnt/archive", Manifest(":memory:"),
                               crawl_workers=2, download_workers=4, verify_all=False,
                               dry_run=False, stop_requested=threading.Event(),
                               initial_files=files, **kwargs)
@@ -267,7 +267,7 @@ class TestPrebuiltFileList(RunConfigGuard):
 
     def test_empty_input_returns_cleanly(self):
         infocon_scraper.RUN.hash_workers = 0
-        counts = run_sync([], "/mnt/archive", Manifest("/nonexistent/m.json"),
+        counts = run_sync([], "/mnt/archive", Manifest(":memory:"),
                           crawl_workers=2, download_workers=2, verify_all=False,
                           dry_run=False, stop_requested=threading.Event(),
                           initial_files=[], max_pending_downloads=4)
@@ -312,7 +312,7 @@ class TestNoBusyLoop(RunConfigGuard):
                 patch("infocon_scraper.wait", side_effect=counting_wait):
             threading.Timer(0.5, blocked.set).start()
             run_sync([("https://infocon.org/cons/", "cons")], "/mnt/archive",
-                     Manifest("/nonexistent/m.json"), crawl_workers=2, download_workers=2,
+                     Manifest(":memory:"), crawl_workers=2, download_workers=2,
                      verify_all=False, dry_run=False, stop_requested=threading.Event(),
                      max_pending_downloads=2)
 

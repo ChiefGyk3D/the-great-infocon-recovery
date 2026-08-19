@@ -119,6 +119,14 @@ python3 -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
+To run the test suite and linter:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest tests/ -v
+ruff check .
+```
+
 ## HTTP Sync
 
 ### Fresh Builds and Refreshes
@@ -377,7 +385,7 @@ The panes are:
 
 The overview pane just tails a snapshot file (`infocon-monitor.out`) written by the separate `monitoring/monitor_infocon.sh` daemon, so that daemon must be running for the overview pane to show live data; `bin/start-dashboard.sh` starts it automatically if it isn't already. The network and disk panes default to `eno1` and `sdc`; `bin/start-dashboard.sh` reads `INFOCON_NETWORK_INTERFACE` and `INFOCON_DISK_DEVICE` and passes them through. Running `monitoring/monitor_network_io.sh` or `monitoring/monitor_disk_io.sh` directly instead takes the interface/device as a positional argument, e.g. `./monitoring/monitor_disk_io.sh nvme0n1 10`. The torrent pane truncates checking/queued entries at `INFOCON_TORRENT_MAX_IDLE_LINES` (default 10). Detach with `Ctrl-b d`; the session and scraper continue running. Reattach with `./bin/tmux-infocon.sh attach -t infocon-monitor`, list sessions with `./bin/tmux-infocon.sh ls`, and stop only the dashboard with `./bin/tmux-infocon.sh kill-session -t infocon-monitor`.
 
-The HTTP manifest is stored at `<destination>/.infocon_manifest.json` by default. Logs can be placed elsewhere with `--log-file`.
+The HTTP manifest is a SQLite database at `<destination>/.infocon_manifest.db` by default; override it with `--manifest`. An existing `.infocon_manifest.json` from an earlier version is imported once on first run, so a drive keeps every hash it has already recorded. Logs can be placed elsewhere with `--log-file`.
 
 ## Robustness
 
@@ -389,7 +397,7 @@ The HTTP sync is built to survive interruptions and large runs:
 - **One writer per file.** Concurrent HTTP phases can discover the same file; only one worker is ever allowed to stage a given destination path, so two transfers can never share a `.part`.
 - **Bounded memory.** Download scheduling is capped (`--max-pending-downloads`, default `workers * 4`) so very large trees cannot accumulate hundreds of thousands of in-memory tasks.
 - **Disk-space guard.** A download that would leave less than `--min-free-gib` (default 1) free is refused, and a genuinely full destination halts the run cleanly instead of writing corrupt files.
-- **Periodic manifest saves.** The verification manifest is flushed every 200 completions, so a crash or power loss keeps most hash progress. Size and modification time are recorded as soon as a download lands, before its hash is computed, so an interrupted run still keeps the fast path.
+- **Incremental manifest writes.** The verification manifest is a SQLite database in WAL mode, so a save writes only what changed. It was previously one JSON document rewritten in full every 200 completions, which across ~450k files meant serialising tens of megabytes thousands of times while every worker waited on the same lock. Size and modification time are recorded as soon as a download lands, before its hash is computed, so an interrupted run still keeps the fast path.
 - **Cheap refreshes.** A file whose local size and the listing's published modification time both match the manifest is skipped without any network request. Only files that look changed, unknown, or `--verify-all` cost a HEAD.
 - **Single-instance lock.** A `.infocon_scraper.lock` PID file under the destination prevents two syncs from racing on the same drive. Stale locks (dead PID) are reclaimed automatically; override with `--force`.
 - **Signal handling.** `SIGINT`/`SIGTERM` finish in-flight downloads, save the manifest, checkpoint torrent fast-resume data, and release the lock. The torrent phase runs on its own thread and is stopped through the same signal, rather than being left running while shutdown waits on it.

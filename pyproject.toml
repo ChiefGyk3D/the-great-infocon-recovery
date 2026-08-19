@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "the-great-infocon-recovery"
+version = "1.0.0"
+description = "Rebuild and maintain a local time capsule of the InfoCon.org and DEF CON media archives"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-or-later" }
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "libtorrent>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+infocon-scraper = "infocon_scraper:main"
+infocon-torrents = "fetch_defcon_torrents:main"
+
+[tool.setuptools]
+py-modules = ["infocon_scraper", "fetch_defcon_torrents"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "C4", "SIM"]
+ignore = [
+    # Suppressing a failed cleanup with contextlib is not clearer than try/except
+    # here, and these paths must never raise.
+    "SIM105",
+    # Line length is not enforced yet: the existing argparse help strings and
+    # status prints exceed it in ~26 places, and rewrapping them is unrelated
+    # churn. Everything that catches real defects stays on.
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
