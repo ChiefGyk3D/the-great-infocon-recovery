@@ -177,6 +177,36 @@ def progress_bar(fraction: float, width: int = 24) -> str:
     return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
+# Bytes already on disk in .part files that have not completed yet. Without
+# this the reported rate only moves when a file finishes, so a run pulling
+# several multi-gigabyte archives displays 0 B/s and a nonsense ETA for hours.
+_inflight_parts: dict[str, int] = {}
+_inflight_lock = threading.Lock()
+
+
+def register_part(part_path: str, baseline: int) -> None:
+    with _inflight_lock:
+        _inflight_parts[part_path] = baseline
+
+
+def unregister_part(part_path: str) -> None:
+    with _inflight_lock:
+        _inflight_parts.pop(part_path, None)
+
+
+def inflight_bytes() -> int:
+    """Bytes fetched so far by transfers still in progress."""
+    with _inflight_lock:
+        staged = list(_inflight_parts.items())
+    total = 0
+    for path, baseline in staged:
+        try:
+            total += max(0, os.path.getsize(path) - baseline)
+        except OSError:
+            continue
+    return total
+
+
 class ProgressStats:
     """Thread-safe aggregate counters shared between the download workers and
     the status reporter thread."""
@@ -252,10 +282,13 @@ class StatusReporter(threading.Thread):
         now = time.time()
         elapsed = now - self.stats.start
         window = now - self._last_time
-        cur_rate = (s["downloaded_bytes"] - self._last_bytes) / window if window > 0 else 0.0
-        avg_rate = s["downloaded_bytes"] / elapsed if elapsed > 0 else 0.0
+        # Completed bytes plus whatever in-flight transfers have staged, so the
+        # rate reflects work actually happening rather than only completions.
+        moved_bytes = s["downloaded_bytes"] + inflight_bytes()
+        cur_rate = (moved_bytes - self._last_bytes) / window if window > 0 else 0.0
+        avg_rate = moved_bytes / elapsed if elapsed > 0 else 0.0
         self._last_time = now
-        self._last_bytes = s["downloaded_bytes"]
+        self._last_bytes = moved_bytes
 
         discovered = s["discovered"]
         completed = s["completed"]
@@ -266,7 +299,7 @@ class StatusReporter(threading.Thread):
 
         line = (
             f"{progress_bar(fraction)} {completed}/{discovered} ({fraction * 100:4.1f}%) | "
-            f"dl {int(s['downloaded_files'])} files {human_bytes(s['downloaded_bytes'])} "
+            f"dl {int(s['downloaded_files'])} files {human_bytes(moved_bytes)} "
             f"@ {human_bytes(cur_rate)}/s (avg {human_bytes(avg_rate)}/s) | "
             f"skip {int(s['skipped'])} err {int(s['errors'])} | act {int(s['active'])} | "
             f"{format_duration(elapsed)} elapsed, ETA {format_duration(eta)}"
@@ -434,6 +467,15 @@ def download_atomic(url: str, local_path: str, remote_size: int | None) -> None:
     looks complete. Resumes an existing .part when the server supports it, and
     retries with backoff on failure or size mismatch."""
     part = local_path + ".part"
+    last_err: str | None = None
+    register_part(part, os.path.getsize(part) if os.path.exists(part) else 0)
+    try:
+        _download_attempts(url, local_path, remote_size, part)
+    finally:
+        unregister_part(part)
+
+
+def _download_attempts(url: str, local_path: str, remote_size: int | None, part: str) -> None:
     last_err: str | None = None
     for attempt in range(1, RUN.retries + 1):
         part_size = os.path.getsize(part) if os.path.exists(part) else 0
@@ -1064,7 +1106,8 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
                             skip: list[str] | None = None,
                             stalled_callback: Callable[[str], None] | None = None,
                             discovery_event: threading.Event | None = None,
-                            infocon_candidates: list[dict] | None = None) -> int:
+                            infocon_candidates: list[dict] | None = None,
+                            stop_event: threading.Event | None = None) -> int:
     """Run the DEF CON torrent fetcher in-process so the single-entry workflow remains simple.
 
     When *infocon_candidates* is provided (from scan_infocon_tree), the torrent
@@ -1099,6 +1142,8 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
         discovery_workers=args.torrent_discovery_workers,
         max_defcon_active=max(0, args.torrent_max_defcon_active),
         torrent_order=args.torrent_order,
+        status_lines=max(0, args.torrent_status_lines),
+        resume_save_minutes=max(1, args.torrent_resume_save_minutes),
     )
     log.info("Running DEF CON torrent phase into %s ...", torrent_dest)
     return fetch_all(dest=torrent_dest,
@@ -1113,6 +1158,7 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
                      index_path=args.torrent_index or os.path.join(
                          os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-index.json"
                      ),
+                     stop_event=stop_event,
                      index_ttl_hours=max(0, args.torrent_index_ttl_hours),
                      checkpoint_path=args.torrent_discovery_checkpoint or os.path.join(
                          os.path.expanduser("~"), ".cache", "infocon-scraper", "torrent-discovery-checkpoint.json"
@@ -1569,6 +1615,11 @@ def main() -> int:
                          help="If --with-torrents is set, libtorrent connection cap (default: 800)")
     parser.add_argument("--torrent-poll-seconds", type=int, default=10,
                          help="If --with-torrents is set, progress refresh interval in seconds (default: 10)")
+    parser.add_argument("--torrent-status-lines", type=int, default=10,
+                         help="Per-torrent detail lines logged each poll; the rest are summarised (default: 10)")
+    parser.add_argument("--torrent-resume-save-minutes", type=int, default=5,
+                         help="Minutes between fast-resume checkpoints so a restart skips re-hashing "
+                              "already-verified content (default: 5)")
     parser.add_argument("--torrent-seed-time", type=int, default=0,
                          help="If --with-torrents is set, minutes to seed after completion (default: 0)")
     parser.add_argument("--torrent-stalled-minutes", type=int, default=30,
@@ -1796,6 +1847,7 @@ def main() -> int:
                         args.dest, torrent_only, args, ready_event=torrent_ready, skip=skip_recent,
                         stalled_callback=start_stalled_http_fallback,
                         discovery_event=torrent_discovery,
+                        stop_event=stop_requested,
                     )
                 except Exception:
                     log.exception("DEF CON torrent phase failed unexpectedly.")
