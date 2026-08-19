@@ -1298,9 +1298,10 @@ def main() -> int:
                     shared_inventory_ready.set()
 
             def run_stalled_http_fallback(spec) -> None:
-                fallback_url = urljoin(spec.url, "./")
-                relative_root = os.path.relpath(spec.save_path, args.dest)
-                root = (fallback_url, relative_root)
+                if re.search(r"\bdef con\b", spec.name, re.IGNORECASE):
+                    root = build_defcon_media_fallback_root(args.defcon_media_url, spec.name)
+                else:
+                    root = (urljoin(spec.url, "./"), os.path.relpath(spec.save_path, args.dest))
                 log.warning("Torrent %s is stalled; starting HTTP fallback for %s", spec.name, root[1])
                 result = run_sync(
                     [root], args.dest, manifest, args.crawl_workers, args.workers,
