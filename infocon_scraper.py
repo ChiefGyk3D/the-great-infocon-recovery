@@ -100,6 +100,11 @@ log = logging.getLogger("infocon_scraper")
 class RemoteFile:
     url: str
     rel_path: str
+    # Published metadata from the directory listing. `modified` drives the
+    # size+mtime fast path that avoids a HEAD per file on a refresh; `size` is
+    # a rounded scheduling hint, never used for verification.
+    modified: float = 0.0
+    size: int | None = None
 
 
 class CurlError(RuntimeError):
@@ -118,6 +123,12 @@ class RunConfig:
     # stall_seconds - a genuinely dead connection, not merely a slow one.
     min_speed_bytes: int = 1024
     stall_seconds: int = 300
+    # 0 keeps the per-host defaults in HOST_CONCURRENCY_LIMITS.
+    metadata_connections: int = 0
+    transfer_connections: int = 0
+    hash_workers: int = 2
+    large_file_bytes: int = 1 << 30
+    max_large_downloads: int = 2
     listing_retries: int = 3
     listing_retry_delay: float = 5.0
     min_free_bytes: int = 1 << 30  # keep at least 1 GiB free
@@ -318,31 +329,55 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-# media.defcon.org appears to throttle/drop connections once too many are
-# open at once (crawl + download workers combined easily exceed a dozen).
-# Cap concurrent requests per host to avoid connection-timeout errors that
-# silently drop whole subfolders from the crawl.
-HOST_CONCURRENCY_LIMITS = {"infocon.org": 4, "media.defcon.org": 6}
-_host_semaphores: dict[str, threading.Semaphore] = {}
+# These hosts throttle or drop connections once too many are open at once, so
+# concurrency is capped per host. Metadata and transfers get separate budgets:
+# a single semaphore shared by both meant a handful of multi-gigabyte downloads
+# held every slot for hours, starving directory listings and HEAD requests on
+# the same host and stalling discovery completely.
+METADATA = "metadata"
+TRANSFER = "transfer"
+
+HOST_CONCURRENCY_LIMITS = {
+    "infocon.org": {METADATA: 4, TRANSFER: 4},
+    "media.defcon.org": {METADATA: 6, TRANSFER: 6},
+}
+_host_semaphores: dict[tuple[str, str], threading.Semaphore] = {}
 _host_semaphores_lock = threading.Lock()
 
 
-def host_semaphore(url: str) -> threading.Semaphore | None:
+def host_limit(host: str, kind: str) -> int | None:
+    """Effective concurrency for a host, honouring any CLI override."""
+    limits = HOST_CONCURRENCY_LIMITS.get(host)
+    if not limits:
+        return None
+    override = RUN.metadata_connections if kind == METADATA else RUN.transfer_connections
+    return override if override else limits.get(kind)
+
+
+def host_semaphore(url: str, kind: str = METADATA) -> threading.Semaphore | None:
+    """The connection budget for *url*, or None when the host is uncapped."""
     host = urlparse(url).netloc
-    limit = HOST_CONCURRENCY_LIMITS.get(host)
+    limit = host_limit(host, kind)
     if not limit:
         return None
+    key = (host, kind)
     with _host_semaphores_lock:
-        sem = _host_semaphores.get(host)
+        sem = _host_semaphores.get(key)
         if sem is None:
             sem = threading.Semaphore(limit)
-            _host_semaphores[host] = sem
+            _host_semaphores[key] = sem
         return sem
 
 
+def _reset_host_semaphores() -> None:
+    """Test hook: drops cached semaphores so new limits take effect."""
+    with _host_semaphores_lock:
+        _host_semaphores.clear()
+
+
 def run_curl(args: list[str], timeout: int, url: str | None = None,
-             stall_guard: bool = False) -> subprocess.CompletedProcess:
-    """Run curl under the per-host concurrency cap.
+             stall_guard: bool = False, kind: str = METADATA) -> subprocess.CompletedProcess:
+    """Run curl under the per-host concurrency budget for *kind*.
 
     *timeout* is a hard wall-clock cap and is only applied when positive; bulk
     transfers pass stall_guard=True instead so a slow-but-alive download is
@@ -354,7 +389,7 @@ def run_curl(args: list[str], timeout: int, url: str | None = None,
         command += ["--speed-limit", str(RUN.min_speed_bytes), "--speed-time", str(RUN.stall_seconds)]
     if timeout and timeout > 0:
         command += ["--max-time", str(timeout)]
-    sem = host_semaphore(url) if url else None
+    sem = host_semaphore(url, kind) if url else None
     if sem:
         sem.acquire()
     try:
@@ -388,7 +423,7 @@ def curl_download(url: str, local_path: str, resume: bool, timeout: int = 0) -> 
         # Also makes curl's own --retry resume rather than truncate and restart.
         args += ["-C", "-"]
     args += [url]
-    proc = run_curl(args, timeout, url=url, stall_guard=True)
+    proc = run_curl(args, timeout, url=url, stall_guard=True, kind=TRANSFER)
     if proc.returncode != 0:
         raise CurlError(f"curl download failed ({proc.returncode}) for {url}: {proc.stderr.decode(errors='replace').strip()}")
 
@@ -613,6 +648,15 @@ def list_directory(url: str) -> list[dict]:
     return entries
 
 
+def is_large_transfer(item: RemoteFile) -> bool:
+    """True when the listing says this file is big enough to hog a slot.
+
+    Unknown sizes count as small: the listing hint is missing for some themes,
+    and treating those as large would stall the queue behind them.
+    """
+    return bool(item.size and item.size >= RUN.large_file_bytes)
+
+
 def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest", crawl_workers: int,
              download_workers: int, verify_all: bool, dry_run: bool, stop_requested: threading.Event,
              initial_files: list[RemoteFile] | None = None,
@@ -626,92 +670,143 @@ def run_sync(roots: list[tuple[str, str]], dest_root: str, manifest: "Manifest",
     BSides - submitted first) start downloading right away, without being
     blocked behind huge, slow-to-list trees (e.g. vx underground's hundreds of
     thousands of malware-sample folders) discovered from later roots.
+
+    Very large files are limited to `--max-large-downloads` concurrent
+    transfers. Without that cap the queue order alone decides scheduling, and a
+    run that happens to reach several multi-gigabyte archives at once gives up
+    every download slot to them for hours.
     """
     counts: dict[str, int] = {}
     discovered = 0
     completed = 0
-    ready_files = deque(initial_files or [])
+    ready_small: deque[RemoteFile] = deque()
+    ready_large: deque[RemoteFile] = deque()
+
+    def enqueue(item: RemoteFile) -> None:
+        (ready_large if is_large_transfer(item) else ready_small).append(item)
+
+    for item in initial_files or []:
+        enqueue(item)
     if initial_files and stats and not initial_files_already_counted:
         stats.add_discovered(len(initial_files))
     discovered += len(initial_files or [])
     pending_downloads = 0
+    active_large = 0
     download_limit = max_pending_downloads or max(download_workers * 4, download_workers)
+    large_limit = max(1, RUN.max_large_downloads)
     skip_filters = [f.lower() for f in (skip_paths or [])]
 
     def skipped(rel_path: str) -> bool:
         lowered = rel_path.lower()
         return bool(skip_filters and any(f in lowered for f in skip_filters))
 
+    def next_ready() -> RemoteFile | None:
+        """Pick the next transfer, keeping large files to their own budget."""
+        nonlocal active_large
+        if ready_large and active_large < large_limit:
+            active_large += 1
+            return ready_large.popleft()
+        if ready_small:
+            return ready_small.popleft()
+        return None
+
     with ThreadPoolExecutor(max_workers=crawl_workers) as crawl_pool, \
             ThreadPoolExecutor(max_workers=download_workers) as dl_pool:
         pending: dict = {}
+        # Listings that finished while the download queue was full. They are
+        # parked here rather than left in `pending`, where an already-completed
+        # future made wait(FIRST_COMPLETED) return instantly on every iteration
+        # and spin the loop at full CPU for as long as downloads stayed busy.
+        deferred_listings: deque = deque()
+
+        def expand_listing(fut, url: str, rel: str) -> None:
+            nonlocal discovered
+            try:
+                entries = fut.result()
+            except Exception as exc:  # noqa: BLE001 - a single bad listing must not kill the whole crawl
+                log.error("Failed to list %s: %s", url, exc)
+                return
+            log.info("Listed %s (%d entries)", url, len(entries))
+            for entry in entries:
+                child_url = urljoin(url, entry["href"])
+                child_rel = os.path.join(rel, entry["name"]) if rel else entry["name"]
+                if skipped(child_rel):
+                    log.info("Skipping configured path: %s", child_rel)
+                    continue
+                if entry["is_dir"]:
+                    pending[crawl_pool.submit(list_directory, child_url)] = ("list", (child_url, child_rel))
+                else:
+                    discovered += 1
+                    if stats:
+                        stats.add_discovered()
+                    enqueue(RemoteFile(url=child_url, rel_path=child_rel,
+                                       modified=entry["modified"], size=entry.get("size")))
+
         for url, rel in roots:
             if skipped(rel):
                 log.info("Skipping configured path: %s", rel)
                 continue
             pending[crawl_pool.submit(list_directory, url)] = ("list", (url, rel))
-        while pending:
+
+        # Scheduling happens before waiting, so a call with no roots but a
+        # pre-built file list still transfers. Driving the loop off `pending`
+        # alone meant run_sync([], initial_files=...) - exactly how combined
+        # mode hands over the shared inventory - returned instantly having
+        # downloaded nothing at all.
+        while True:
             if stop_requested.is_set():
                 break
-            done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
-            for fut in done:
-                kind, payload = pending[fut]
-                if kind == "list" and pending_downloads >= download_limit:
-                    continue
-                pending.pop(fut)
-                if kind == "list":
-                    url, rel = payload
-                    try:
-                        entries = fut.result()
-                    except Exception as exc:  # noqa: BLE001 - a single bad listing must not kill the whole crawl
-                        log.error("Failed to list %s: %s", url, exc)
-                        continue
-                    log.info("Listed %s (%d entries)", url, len(entries))
-                    for entry in entries:
-                        child_url = urljoin(url, entry["href"])
-                        child_rel = os.path.join(rel, entry["name"]) if rel else entry["name"]
-                        if skipped(child_rel):
-                            log.info("Skipping configured path: %s", child_rel)
-                            continue
-                        if entry["is_dir"]:
-                            pending[crawl_pool.submit(list_directory, child_url)] = ("list", (child_url, child_rel))
-                        else:
-                            item = RemoteFile(url=child_url, rel_path=child_rel)
-                            discovered += 1
-                            if stats:
-                                stats.add_discovered()
-                            ready_files.append(item)
-                else:
-                    item = payload
-                    pending_downloads -= 1
-                    try:
-                        result, nbytes = fut.result()
-                    except Exception as exc:  # noqa: BLE001 - log and continue
-                        log.error("Unexpected error for %s: %s", item.rel_path, exc)
-                        result, nbytes = "error", 0
-                    counts[result] = counts.get(result, 0) + 1
-                    completed += 1
-                    if stats:
-                        stats.download_finished(result, nbytes)
-                    if result == "error-diskfull":
-                        log.error("Halting: destination filesystem is full.")
-                        stop_requested.set()
-                    if completed % 25 == 0:
-                        log.info("Progress: %d files completed (%d discovered so far)", completed, discovered)
-                    if completed % RUN.manifest_save_every == 0 and not dry_run:
-                        manifest.save()
 
-            while ready_files and pending_downloads < download_limit:
-                item = ready_files.popleft()
+            while deferred_listings and pending_downloads < download_limit:
+                fut, (url, rel) = deferred_listings.popleft()
+                expand_listing(fut, url, rel)
+
+            while pending_downloads < download_limit:
+                item = next_ready()
+                if item is None:
+                    break
                 pending[dl_pool.submit(sync_file, item, dest_root, manifest, verify_all, dry_run)] = \
                     ("sync", item)
                 pending_downloads += 1
                 if stats:
                     stats.download_started()
 
-            if not pending and ready_files:
-                log.error("Stopping with %d discovered files still queued", len(ready_files))
+            if not pending:
+                # Nothing is in flight, so nothing can free capacity later.
+                queued = len(ready_small) + len(ready_large)
+                if queued or deferred_listings:
+                    log.error("Stopping with %d discovered files still queued", queued)
                 break
+
+            done, _ = wait(list(pending.keys()), return_when=FIRST_COMPLETED)
+            for fut in done:
+                kind, payload = pending.pop(fut)
+                if kind == "list":
+                    if pending_downloads >= download_limit:
+                        deferred_listings.append((fut, payload))
+                        continue
+                    expand_listing(fut, *payload)
+                    continue
+                item = payload
+                pending_downloads -= 1
+                if is_large_transfer(item):
+                    active_large -= 1
+                try:
+                    result, nbytes = fut.result()
+                except Exception as exc:  # noqa: BLE001 - log and continue
+                    log.error("Unexpected error for %s: %s", item.rel_path, exc)
+                    result, nbytes = "error", 0
+                counts[result] = counts.get(result, 0) + 1
+                completed += 1
+                if stats:
+                    stats.download_finished(result, nbytes)
+                if result == "error-diskfull":
+                    log.error("Halting: destination filesystem is full.")
+                    stop_requested.set()
+                if completed % 25 == 0:
+                    log.info("Progress: %d files completed (%d discovered so far)", completed, discovered)
+                if completed % RUN.manifest_save_every == 0 and not dry_run:
+                    manifest.save()
 
     log.info("Progress: %d files completed (%d discovered total)", completed, discovered)
     return counts
@@ -754,6 +849,71 @@ class Manifest:
             os.replace(tmp, self.path)
 
 
+def _record(manifest: "Manifest", rel: str, item: "RemoteFile", size: int,
+            digest: str | None) -> None:
+    """Write a manifest entry, preserving a known hash when none is supplied."""
+    entry = {
+        "size": size,
+        "url": item.url,
+        "mtime": item.modified or None,
+        "verified": time.time(),
+    }
+    if digest is None:
+        existing = manifest.get(rel) or {}
+        digest = existing.get("sha256")
+    if digest:
+        entry["sha256"] = digest
+    manifest.set(rel, entry)
+
+
+# Hashing a freshly downloaded file means reading it back in full. Doing that
+# inside the download worker holds a scarce download slot for minutes on a
+# multi-gigabyte file, so it runs on its own small pool instead.
+_hash_pool: ThreadPoolExecutor | None = None
+_hash_futures: list = []
+_hash_lock = threading.Lock()
+
+
+def schedule_hash(manifest: "Manifest", rel: str, local_path: str,
+                  item: "RemoteFile", size: int) -> None:
+    global _hash_pool
+
+    def run() -> None:
+        try:
+            digest = sha256_file(local_path)
+        except OSError as exc:
+            log.warning("Could not hash %s: %s", rel, exc)
+            return
+        _record(manifest, rel, item, size, digest)
+
+    with _hash_lock:
+        if RUN.hash_workers <= 0:
+            run()
+            return
+        if _hash_pool is None:
+            _hash_pool = ThreadPoolExecutor(max_workers=RUN.hash_workers,
+                                            thread_name_prefix="hash")
+        _hash_futures.append(_hash_pool.submit(run))
+        # Keep the tracking list from growing across a long run.
+        if len(_hash_futures) > 512:
+            _hash_futures[:] = [f for f in _hash_futures if not f.done()]
+
+
+def drain_hashes() -> None:
+    """Block until every queued hash has been recorded in the manifest."""
+    global _hash_pool
+    with _hash_lock:
+        pool, _hash_pool = _hash_pool, None
+        pending = list(_hash_futures)
+        _hash_futures.clear()
+    if not pool:
+        return
+    outstanding = sum(1 for f in pending if not f.done())
+    if outstanding:
+        log.info("Waiting for %d outstanding file hash(es) ...", outstanding)
+    pool.shutdown(wait=True)
+
+
 ARCHIVE_EXTENSIONS = {".rar", ".zip", ".7z"}
 
 
@@ -787,6 +947,27 @@ def sync_file(item: RemoteFile, dest_root: str, manifest: Manifest,
         _release_path(claim, finished)
 
 
+MTIME_TOLERANCE_SECONDS = 2.0
+
+
+def _listing_matches_manifest(item: RemoteFile, entry: dict | None, local_size: int) -> bool:
+    """True when the listing agrees with what we already recorded for this file.
+
+    Lets a refresh skip a verified file without a HEAD request. Matching on the
+    published modification time rather than the listed size is deliberate: the
+    listed size is rounded, the timestamp is exact. Entries written before
+    mtimes were recorded simply miss the fast path once, then gain one.
+    """
+    if not entry or not item.modified:
+        return False
+    recorded_mtime = entry.get("mtime")
+    if not recorded_mtime:
+        return False
+    if abs(float(recorded_mtime) - item.modified) > MTIME_TOLERANCE_SECONDS:
+        return False
+    return entry.get("size") == local_size
+
+
 def _sync_one_file(item: RemoteFile, local_path: str, manifest: Manifest,
                    verify_all: bool, dry_run: bool) -> tuple[str, int]:
     rel = item.rel_path
@@ -795,29 +976,34 @@ def _sync_one_file(item: RemoteFile, local_path: str, manifest: Manifest,
         log.info("Skipping %s (already have the unpacked folder)", rel)
         return "skip-duplicate-archive", 0
 
+    exists = os.path.exists(local_path)
+    local_size = os.path.getsize(local_path) if exists else 0
+    entry = manifest.get(rel)
+
+    # Consult what we already know before touching the network. This used to be
+    # a HEAD per file regardless, which on a refresh of a complete drive is one
+    # request per file - hundreds of thousands of them - to learn nothing.
+    if exists and not verify_all and _listing_matches_manifest(item, entry, local_size):
+        return "skip-known-good", 0
+
     try:
         remote_size = curl_head_size(item.url)
     except CurlError as exc:
         log.error("HEAD failed for %s: %s", item.url, exc)
         return "error", 0
 
-    exists = os.path.exists(local_path)
-    local_size = os.path.getsize(local_path) if exists else 0
-
     if exists and remote_size is not None and local_size == remote_size:
-        entry = manifest.get(rel)
         if entry and entry.get("size") == remote_size and not verify_all:
+            _record(manifest, rel, item, remote_size, entry.get("sha256"))
             return "skip-known-good", 0
         digest = sha256_file(local_path)
         if entry and entry.get("sha256") == digest:
-            manifest.set(rel, {"size": remote_size, "sha256": digest, "url": item.url,
-                                "verified": time.time()})
+            _record(manifest, rel, item, remote_size, digest)
             return "skip-verified", 0
         if entry and entry.get("sha256") != digest:
             log.warning("Corruption detected for %s (hash mismatch), re-downloading", rel)
         else:
-            manifest.set(rel, {"size": remote_size, "sha256": digest, "url": item.url,
-                                "verified": time.time()})
+            _record(manifest, rel, item, remote_size, digest)
             return "baseline-recorded", 0
 
     part_path = local_path + ".part"
@@ -848,8 +1034,11 @@ def _sync_one_file(item: RemoteFile, local_path: str, manifest: Manifest,
         log.error("Size mismatch after download for %s (got %d, expected %d)", rel, final_size, remote_size)
         return "error", 0
 
-    digest = sha256_file(local_path)
-    manifest.set(rel, {"size": final_size, "sha256": digest, "url": item.url, "verified": time.time()})
+    # Record size and mtime now so an interrupted run still gets the fast path
+    # next time, and hash off the critical path - re-reading a 13 GB file would
+    # otherwise hold a download slot for minutes after the transfer finished.
+    _record(manifest, rel, item, final_size, None)
+    schedule_hash(manifest, rel, local_path, item, final_size)
     log.info("Downloaded %s (%d bytes)", rel, final_size)
     return "downloaded", final_size
 
@@ -974,7 +1163,8 @@ def discover_mirror_files(root_url: str, filters: list[str] | None) -> list[Remo
     lowered = [f.lower() for f in filters]
     return [
         RemoteFile(url=urljoin(urljoin(root_url, "mirrors/"), entry["href"]),
-                   rel_path=os.path.join("mirrors", entry["name"]))
+                   rel_path=os.path.join("mirrors", entry["name"]),
+                   modified=entry["modified"], size=entry.get("size"))
         for entry in entries
         if not entry["is_dir"]
         and not entry["name"].lower().endswith(".torrent")
@@ -1202,7 +1392,9 @@ def scan_infocon_tree(
                             "save_path": os.path.join(dest_root, rel),
                         })
                     elif is_http:
-                        http_files.append(RemoteFile(url=child_url, rel_path=child_rel))
+                        http_files.append(RemoteFile(url=child_url, rel_path=child_rel,
+                                                    modified=entry["modified"],
+                                                    size=entry.get("size")))
                         if stats:
                             stats.add_discovered()
                 now = time.time()
@@ -1321,6 +1513,21 @@ def main() -> int:
     parser.add_argument("--max-pending-downloads", type=int, default=None,
                          help="Maximum queued/in-flight file downloads (default: workers * 4)")
     parser.add_argument("--crawl-workers", type=int, default=16, help="Concurrent directory-listing workers")
+    parser.add_argument("--metadata-connections", type=int, default=0,
+                         help="Per-host cap on concurrent directory listings and HEAD requests; "
+                              "0 keeps the built-in per-host defaults (infocon.org 4, media.defcon.org 6)")
+    parser.add_argument("--transfer-connections", type=int, default=0,
+                         help="Per-host cap on concurrent file downloads, budgeted separately from "
+                              "metadata so large transfers cannot starve discovery; 0 keeps the defaults")
+    parser.add_argument("--large-file-gib", type=float, default=1.0,
+                         help="Files at least this large (per the directory listing) are scheduled under "
+                              "the large-transfer budget (default: 1)")
+    parser.add_argument("--max-large-downloads", type=int, default=2,
+                         help="Maximum concurrent large transfers, so a handful of multi-gigabyte "
+                              "archives cannot take every download slot (default: 2)")
+    parser.add_argument("--hash-workers", type=int, default=2,
+                         help="Background workers that SHA-256 completed downloads; 0 hashes inline "
+                              "in the download worker (default: 2)")
     parser.add_argument("--status-interval", type=float, default=10.0,
                          help="Seconds between progress/speed status lines (default: 10; 0 disables)")
     parser.add_argument("--content-order", choices=("newest", "oldest"), default="newest",
@@ -1429,6 +1636,11 @@ def main() -> int:
     RUN.listing_retry_delay = max(0.0, args.listing_retry_delay)
     RUN.min_free_bytes = max(0, args.min_free_gib) * (1 << 30)
     RUN.content_order = args.content_order
+    RUN.metadata_connections = max(0, args.metadata_connections)
+    RUN.transfer_connections = max(0, args.transfer_connections)
+    RUN.hash_workers = max(0, args.hash_workers)
+    RUN.large_file_bytes = max(0, int(args.large_file_gib * (1 << 30)))
+    RUN.max_large_downloads = max(1, args.max_large_downloads)
 
     lock_path = shared_drive_lock_path(args.dest)
     if not acquire_lock(lock_path, force=args.force):
@@ -1646,6 +1858,7 @@ def main() -> int:
             # The torrent thread has stopped, so no further fallbacks can be
             # queued; drain whatever it handed over.
             fallback_pool.shutdown(wait=True)
+        drain_hashes()
         if reporter:
             reporter.stop()
             reporter.join(timeout=args.status_interval + 2)
