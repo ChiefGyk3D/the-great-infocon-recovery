@@ -9,7 +9,8 @@ This project is licensed under the GNU General Public License v3.0. See [LICENSE
 `infocon_scraper.py` mirrors:
 
 - All conferences under `infocon.org/cons/`, with DEF CON and BSides submitted first.
-- `documentaries/`, `podcasts/`, `rainbow tables/`, `skills/`, and `word lists/`.
+- `documentaries/`, `podcasts/`, `skills/`, and `word lists/` by default.
+- `rainbow tables/` only when explicitly requested; it is a separate multi-terabyte dataset.
 - Selected folders from `media.defcon.org`, normally DEF CON content that is missing from InfoCon.
 - Nested files into their corresponding source folders. It does not flatten archives into a new top-level namespace.
 
@@ -47,7 +48,15 @@ The current six-drive DDV layout is:
 
 Drive A is the InfoCon archive this project is designed to build. Drive D's VX Underground material is represented by the relevant mirror collections described below. Drives B, C, E, and F are separate hash-table datasets and are not automatically supplied by `infocon_scraper.py`; keep them in their own destination trees rather than combining them with the InfoCon mirror.
 
-The normal top-level `rainbow tables/` section may contain related material, but it should not be treated as a complete replacement for Drives B, C, E, or F without checking the source inventory.
+The `rainbow tables/` directory is the authoritative source for the separate hash-table datasets. Its README lists A51 (1.5 TB), LANMAN (0.4 TB), MD5 (3.5 TB), MySQL SHA-1 (1.3 TB), NTLM (3.6 TB), NTLM 9 (6.7 TB), and NetNTLMv1 (4.3 TB compressed from 8 TB). It is excluded from the default archive crawl and torrent inventory because it is a separate multi-terabyte drive workload. Opt in explicitly:
+
+```bash
+python infocon_scraper.py --dest "/path/to/drive" \
+  --only-top "rainbow tables"
+
+python fetch_defcon_torrents.py --dest "/path/to/drive" \
+  --include-rainbow-tables
+```
 
 To target the DDV-related mirror collection without crawling every conference:
 
@@ -175,7 +184,7 @@ python infocon_scraper.py --dest "/path/to/drive" \
 
 The per-archive torrents are BitTorrent v2 metadata. Older distro versions of `aria2c` and `transmission-cli` may reject them, so the helper uses Python `libtorrent`.
 
-Combined mode recursively searches the current online InfoCon tree for `.torrent` files, including nested paths such as `documentaries/Hacker Movies/`, regardless of whether those files or folders exist on the destination drive. It excludes `mirrors/` by default because that tree is enormous; opt in with `--torrent-include-mirrors`. Torrent content is saved beneath the matching source-relative destination tree rather than flattened into `cons/DEF CON`.
+Combined mode recursively searches the current online InfoCon tree for `.torrent` files, including nested paths such as `documentaries/Hacker Movies/`, regardless of whether those files or folders exist on the destination drive. It excludes `mirrors/` and `rainbow tables/` by default because those are separate enormous workloads; opt in with `--torrent-include-mirrors` and/or `--torrent-include-rainbow-tables`. Torrent content is saved beneath the matching source-relative destination tree rather than flattened into `cons/DEF CON`.
 
 Fetch and verify every available DEF CON torrent:
 

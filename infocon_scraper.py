@@ -79,7 +79,6 @@ DEFCON_MEDIA_ROOT_URL = "https://media.defcon.org/"
 TOP_LEVEL_SECTIONS = [
     "documentaries",
     "podcasts",
-    "rainbow tables",
     "skills",
     "word lists",
 ]
@@ -726,7 +725,9 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
                      torrents_dir=os.path.join(os.path.expanduser("~"), ".cache", "infocon-scraper", "torrents"),
                      only=only, settings=settings, ready_event=ready_event, skip=skip,
                      stalled_callback=stalled_callback, torrent_roots=torrent_roots,
-                     include_mirrors=args.torrent_include_mirrors, defcon_only=defcon_only,
+                     include_mirrors=args.torrent_include_mirrors,
+                     include_rainbow_tables=args.torrent_include_rainbow_tables,
+                     defcon_only=defcon_only,
                      discovery_event=discovery_event)
 
 
@@ -933,7 +934,7 @@ def main() -> int:
                               "synced (default: all conferences)")
     parser.add_argument("--only-top", default=None,
                          help="Comma-separated substrings to restrict which infocon.org top-level sections "
-                              "besides cons/ are synced, e.g. 'documentaries,podcasts' (default: all sections)")
+                            "besides cons/ are synced, e.g. 'documentaries,podcasts,rainbow tables' (default: archive sections; rainbow tables require explicit opt-in)")
     parser.add_argument("--only-mirrors", default=None,
                          help="Comma-separated mirror name filters, e.g. 'cryptome,textfiles'; downloads only "
                               "matching collections under infocon.org/mirrors/")
@@ -980,6 +981,8 @@ def main() -> int:
                          help="DEF CON numbers fetched by combined mode; default: 30,31,32,33,34")
     parser.add_argument("--torrent-include-mirrors", action="store_true",
                          help="Recursively include infocon.org/mirrors torrent files; disabled by default")
+    parser.add_argument("--torrent-include-rainbow-tables", action="store_true",
+                         help="Recursively include infocon.org/rainbow tables torrents; disabled by default")
     parser.add_argument("--torrent-discovery-workers", type=int, default=8,
                          help="Concurrent recursive torrent listing workers (default: 8)")
     parser.add_argument("--manifest", default=None, help="Path to manifest JSON (default: <dest>/.infocon_manifest.json)")

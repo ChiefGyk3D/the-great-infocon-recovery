@@ -180,11 +180,12 @@ def _listing_entries(html: str) -> list[tuple[str, str, bool]]:
 
 
 def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentSettings,
-                                include_mirrors: bool = False) -> list[TorrentSpec]:
-    """Recursively find torrent files, excluding the huge mirrors tree by default."""
+                                include_mirrors: bool = False,
+                                include_rainbow_tables: bool = False) -> list[TorrentSpec]:
+    """Recursively find torrent files, excluding mirrors and rainbow tables by default."""
     visited: set[str] = set()
     found: dict[str, tuple[int, TorrentSpec]] = {}
-    print(f"Recursive torrent discovery started across {len(roots)} root(s); mirrors={'included' if include_mirrors else 'excluded'}.")
+    print(f"Recursive torrent discovery started across {len(roots)} root(s); mirrors={'included' if include_mirrors else 'excluded'}, rainbow tables={'included' if include_rainbow_tables else 'excluded'}.")
     def fetch_listing(item: tuple[str, str]) -> tuple[str, str, list[tuple[str, str, bool]]]:
         dir_url, save_path = item
         return dir_url, save_path, _listing_entries(curl_text(dir_url, settings))
@@ -212,6 +213,8 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                     child_url = urljoin(dir_url, href)
                     if is_dir:
                         if not include_mirrors and child_url.lower().rstrip("/").endswith("/mirrors"):
+                            continue
+                        if not include_rainbow_tables and child_url.lower().rstrip("/").endswith("/rainbow%20tables"):
                             continue
                         if child_url not in visited:
                             pending[pool.submit(fetch_listing, (child_url, os.path.join(save_path, name)))] = (child_url, os.path.join(save_path, name))
@@ -276,13 +279,17 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               stalled_callback: Callable[[TorrentSpec], None] | None = None,
               torrent_roots: list[tuple[str, str]] | None = None,
               include_mirrors: bool = False,
+              include_rainbow_tables: bool = False,
               defcon_only: list[str] | None = None,
               discovery_event: threading.Event | None = None) -> int:
     os.makedirs(dest, exist_ok=True)
     os.makedirs(torrents_dir, exist_ok=True)
 
     roots = torrent_roots or [(TORRENTS_DIR_URL, dest)]
-    available = discover_torrents_recursive(roots, settings, include_mirrors=include_mirrors)
+    available = discover_torrents_recursive(
+        roots, settings, include_mirrors=include_mirrors,
+        include_rainbow_tables=include_rainbow_tables
+    )
     if only:
         filters = [f.lower() for f in only]
         available = [spec for spec in available if any(f in spec.name.lower() for f in filters)]
@@ -420,6 +427,8 @@ def main() -> int:
                         help="Comma-separated DEF CON numbers to fetch when recursive roots include other sources")
     parser.add_argument("--include-mirrors", action="store_true",
                         help="Recursively search infocon.org/mirrors too; disabled by default because it is enormous")
+    parser.add_argument("--include-rainbow-tables", action="store_true",
+                        help="Recursively search infocon.org/rainbow tables too; disabled by default because it is multi-terabyte")
     parser.add_argument("--discovery-workers", type=int, default=8,
                         help="Concurrent recursive torrent listing workers (default: 8)")
     parser.add_argument("--skip", default=None,
@@ -473,7 +482,9 @@ def main() -> int:
         discovery_workers=max(1, args.discovery_workers),
     )
     return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip,
-                     include_mirrors=args.include_mirrors, defcon_only=defcon_only)
+                     include_mirrors=args.include_mirrors,
+                     include_rainbow_tables=args.include_rainbow_tables,
+                     defcon_only=defcon_only)
 
 
 if __name__ == "__main__":
