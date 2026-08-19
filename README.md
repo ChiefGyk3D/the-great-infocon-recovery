@@ -240,7 +240,7 @@ python infocon_scraper.py \
 
 The combined workflow adds DEF CON 30–34 by default and also discovers non-mirror InfoCon torrents recursively. It immediately crawls non-DEF CON content while torrent files are checked. Once checking finishes, HTTP crawls the torrentless DEF CON remainder while libtorrent continues downloading. A single drive-level lock remains held by the parent process until all phases finish.
 
-Torrent archives are added newest first by DEF CON number. Skip archives that are arriving separately, such as a physical DEF CON or BSides delivery, with one filter applied to both HTTP roots and torrents:
+Torrent archives are added newest first by DEF CON number. Skip archives that are arriving separately, such as a physical DEF CON or BSides delivery, from torrent ownership so HTTP downloads them:
 
 ```bash
 python infocon_scraper.py \
@@ -249,7 +249,7 @@ python infocon_scraper.py \
   --skip-recent "DEF CON 34,BSides Las Vegas 2026"
 ```
 
-The skip list is intentionally explicit so it can be changed each year when a new DEF CON torrent or physical conference delivery becomes available. The standalone torrent helper accepts the equivalent `--skip` option.
+The skip list is intentionally explicit so it can be changed each year when a new DEF CON torrent or physical conference delivery becomes available. It does not exclude those paths from HTTP. The standalone torrent helper accepts the equivalent `--skip` option.
 
 If a torrent has finished checking but stays at zero peers and zero download rate, combined mode pauses it and hands that archive's media folder back to HTTP after 30 minutes by default. Tune the fallback window when needed:
 
