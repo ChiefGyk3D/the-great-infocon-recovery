@@ -105,6 +105,9 @@ def build_command(env: dict[str, str], interactive: bool) -> list[str]:
             discovery_workers = number("Recursive torrent discovery workers", discovery_workers, 1)
         if "INFOCON_TORRENT_STALLED_MINUTES" not in env:
             stalled_minutes = number("Minutes before a dead torrent falls back to HTTP", stalled_minutes, 1)
+    content_order = env.get("INFOCON_CONTENT_ORDER", "newest")
+    if interactive and "INFOCON_CONTENT_ORDER" not in env:
+        content_order = "newest" if menu("Content order", ["Newest first (recommended)", "Oldest first"], 1) == 1 else "oldest"
 
     command = [PYTHON, str(ROOT / "infocon_scraper.py"), "--dest", destination, "--with-torrents"]
     if skip_recent:
@@ -113,6 +116,8 @@ def build_command(env: dict[str, str], interactive: bool) -> list[str]:
         command += ["--torrent-defcon-only", defcon_only]
     command += ["--torrent-discovery-workers", str(discovery_workers),
                 "--torrent-stalled-minutes", str(stalled_minutes),
+                   "--torrent-order", content_order,
+                "--content-order", content_order,
                 "--max-pending-downloads", str(pending)]
     if include_rainbow:
         command.append("--torrent-include-rainbow-tables")

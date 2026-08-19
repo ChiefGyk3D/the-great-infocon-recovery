@@ -110,6 +110,7 @@ class RunConfig:
     download_timeout: int = 3600
     min_free_bytes: int = 1 << 30  # keep at least 1 GiB free
     manifest_save_every: int = 200
+    content_order: str = "newest"
 
 
 # Populated once in main() before any worker starts; read-only during a run.
@@ -447,7 +448,10 @@ def list_directory(url: str) -> list[dict]:
             "is_dir": href.endswith("/"),
             "modified": modified,
         })
-    entries.sort(key=lambda entry: (entry["modified"], not entry["is_dir"], entry["name"].lower()), reverse=True)
+    entries.sort(
+        key=lambda entry: (entry["modified"], not entry["is_dir"], entry["name"].lower()),
+        reverse=RUN.content_order == "newest",
+    )
     return entries
 
 
@@ -719,6 +723,8 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
         retry_delay=3,
         stalled_minutes=args.torrent_stalled_minutes,
         discovery_workers=args.torrent_discovery_workers,
+        max_defcon_active=max(0, args.torrent_max_defcon_active),
+        torrent_order=args.torrent_order,
     )
     log.info("Running DEF CON torrent phase into %s ...", torrent_dest)
     return fetch_all(dest=torrent_dest,
@@ -954,6 +960,8 @@ def main() -> int:
     parser.add_argument("--crawl-workers", type=int, default=16, help="Concurrent directory-listing workers")
     parser.add_argument("--status-interval", type=float, default=10.0,
                          help="Seconds between progress/speed status lines (default: 10; 0 disables)")
+    parser.add_argument("--content-order", choices=("newest", "oldest"), default="newest",
+                         help="Directory/file discovery order (default: newest)")
     parser.add_argument("--retries", type=int, default=4,
                          help="Per-file download attempts before giving up (default: 4)")
     parser.add_argument("--download-timeout", type=int, default=3600,
@@ -970,6 +978,10 @@ def main() -> int:
                             "DEF CON remainder while torrents continue downloading.")
     parser.add_argument("--torrent-max-active", type=int, default=4,
                          help="If --with-torrents is set, maximum simultaneous torrents to fetch, newest first (default: 4)")
+    parser.add_argument("--torrent-max-defcon-active", type=int, default=1,
+                         help="If --with-torrents is set, maximum simultaneous DEF CON torrents (default: 1)")
+    parser.add_argument("--torrent-order", choices=("newest", "oldest"), default="newest",
+                         help="If --with-torrents is set, torrent priority order (default: newest)")
     parser.add_argument("--torrent-connections", type=int, default=800,
                          help="If --with-torrents is set, libtorrent connection cap (default: 800)")
     parser.add_argument("--torrent-poll-seconds", type=int, default=10,
@@ -1034,6 +1046,7 @@ def main() -> int:
     RUN.retries = max(1, args.retries)
     RUN.download_timeout = max(1, args.download_timeout)
     RUN.min_free_bytes = max(0, args.min_free_gib) * (1 << 30)
+    RUN.content_order = args.content_order
 
     lock_path = shared_drive_lock_path(args.dest)
     if not acquire_lock(lock_path, force=args.force):

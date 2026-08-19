@@ -156,6 +156,8 @@ python infocon_scraper.py \
 
 Run the same command again later to refresh the drive. The online directory listings and torrent inventories are checked again; files already verified in the destination manifest are skipped, changed/new files are added, and interrupted `.part` downloads resume. A 2022-era drive is therefore only a resume/cache advantage, never a limit on what the current online scan can discover.
 
+Content discovery defaults to newest-first using the online directory modification metadata, including nested directories. Torrent scheduling also defaults to newest-first. Select `--content-order oldest --torrent-order oldest` for a deliberate historical backfill; the wizard and `.env` expose the same choice.
+
 Useful options:
 
 ```bash

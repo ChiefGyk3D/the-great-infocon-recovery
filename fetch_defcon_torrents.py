@@ -106,6 +106,8 @@ class TorrentSettings:
     retry_delay: int
     stalled_minutes: int = 30
     discovery_workers: int = 8
+    max_defcon_active: int = 1
+    torrent_order: str = "newest"
 
 
 @dataclass(frozen=True)
@@ -241,7 +243,9 @@ def discover_torrents_recursive(roots: list[tuple[str, str]], settings: TorrentS
                             print(f"Torrent candidate replaced: {previous[1].url} -> {child_url}")
                     else:
                         print(f"Torrent candidate ignored: duplicate/lower-priority {child_url}")
-    specs = sorted((spec for _, spec in found.values()), key=lambda spec: torrent_priority(spec.name))
+                    if len(found) % 10 == 0:
+                        print(f"Eligible torrent candidates so far: {len(found)}")
+    specs = sorted((spec for _, spec in found.values()), key=lambda spec: torrent_order_key(spec.name, settings.torrent_order))
     print(f"Recursive torrent discovery complete: scanned {len(visited)} directories, found {len(specs)} torrent files.")
     for spec in specs:
         print(f"Torrent selected for download: {spec.name} -> {spec.url} -> {spec.save_path}")
@@ -293,6 +297,15 @@ def torrent_priority(name: str) -> tuple[int, int, str]:
     if match:
         return (0, -int(match.group(1)), name.lower())
     return (1, 0, name.lower())
+
+
+def torrent_order_key(name: str, order: str) -> tuple[int, int, str]:
+    if order == "oldest":
+        match = re.search(r"\b(?:DEF CON|DC)\s+(\d+)\b", name, re.IGNORECASE)
+        if match:
+            return (0, int(match.group(1)), name.lower())
+        return (1, 0, name.lower())
+    return torrent_priority(name)
 
 
 def torrent_logical_name(name: str) -> str:
@@ -370,7 +383,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     no_activity_since: dict[str, float] = {}
     stalled_names: set[str] = set()
 
-    for spec in sorted(available, key=lambda item: torrent_priority(item.name)):
+    for spec in sorted(available, key=lambda item: torrent_order_key(item.name, settings.torrent_order)):
         name = spec.name
         torrent_url = spec.url
         cache_name = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{spec.save_path}_{name}")
@@ -393,6 +406,7 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     print("Verifying/downloading... (Ctrl+C to stop; already-correct files are skipped automatically)")
     try:
         checking_complete = False
+        scheduler_locked = False
         while True:
             done = 0
             active = []
@@ -434,7 +448,32 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                     active.append((s.download_rate, s.progress, s.num_peers, str(s.state), name))
             # Highest download rate first; ties break newest-DEF-CON-first instead of
             # alphabetically (plain string sort would put "DEF CON 2" ahead of "19").
-            active.sort(key=lambda item: (-item[0], -item[1], -item[2], torrent_priority(item[4])))
+            active.sort(key=lambda item: (-item[0], -item[1], -item[2], torrent_order_key(item[4], settings.torrent_order)))
+            if checking_complete and not scheduler_locked:
+                for handle in handles.values():
+                    handle.set_auto_managed(False)
+                scheduler_locked = True
+            if checking_complete:
+                incomplete = [
+                    (name, handle) for name, handle in handles.items()
+                    if name not in stalled_names and handle.status().progress < 1.0
+                ]
+                defcon = sorted(
+                    (item for item in incomplete if re.search(r"\bdef con\b", item[0], re.IGNORECASE)),
+                    key=lambda item: torrent_order_key(item[0], settings.torrent_order)
+                )
+                other = sorted(
+                    (item for item in incomplete if not re.search(r"\bdef con\b", item[0], re.IGNORECASE)),
+                    key=lambda item: item[0].lower()
+                )
+                active_limit = settings.max_active if settings.max_active > 0 else len(incomplete)
+                selected = defcon[:settings.max_defcon_active] + other[:max(0, active_limit - settings.max_defcon_active)]
+                selected_names = {name for name, _ in selected}
+                for name, handle in incomplete:
+                    if name in selected_names:
+                        handle.resume()
+                    else:
+                        handle.pause()
             total_rate = sum(a[0] for a in active)
             downloading = sum(1 for a in active if a[0] > 0)
             print(f"--- {done}/{len(handles)} complete | {total_rate / 1e6:6.2f} MB/s total | "
@@ -488,6 +527,10 @@ def main() -> int:
                          help=f"Where to cache .torrent files (default: {DEFAULT_TORRENTS_CACHE})")
     parser.add_argument("--max-active", type=int, default=4,
                          help="Maximum simultaneous active torrents; newest are added first; 0 means unlimited (default: 4)")
+    parser.add_argument("--max-defcon-active", type=int, default=1,
+                         help="Maximum simultaneous DEF CON torrents; remaining active slots prefer other InfoCon torrents (default: 1)")
+    parser.add_argument("--torrent-order", choices=("newest", "oldest"), default="newest",
+                        help="Torrent discovery/priority order (default: newest)")
     parser.add_argument("--connections", type=int, default=800,
                          help="Global libtorrent connection limit (default: 800)")
     parser.add_argument("--listen-interface", default="0.0.0.0:6881",
@@ -531,6 +574,8 @@ def main() -> int:
         retry_delay=max(0, args.retry_delay),
         stalled_minutes=max(1, args.stalled_minutes),
         discovery_workers=max(1, args.discovery_workers),
+        max_defcon_active=max(0, args.max_defcon_active),
+        torrent_order=args.torrent_order,
     )
     return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip,
                      include_mirrors=args.include_mirrors,
