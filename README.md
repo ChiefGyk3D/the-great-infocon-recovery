@@ -190,7 +190,24 @@ python infocon_scraper.py --dest "/path/to/drive" --verify-all
 python infocon_scraper.py --dest "/path/to/drive" --dry-run
 ```
 
-The HTTP scraper uses separate directory-listing and download worker pools. It streams work as directories are discovered, so later large trees do not block priority content. Requests to `media.defcon.org` are capped to avoid server throttling. Download scheduling is bounded so very large trees do not create hundreds of thousands of in-memory futures.
+The HTTP scraper uses separate directory-listing and download worker pools. It streams work as directories are discovered, so later large trees do not block priority content. Download scheduling is bounded so very large trees do not create hundreds of thousands of in-memory futures.
+
+Per-host concurrency is capped, with **separate budgets for metadata and transfers**. Directory listings and HEAD requests draw on one budget, file downloads on another, so a handful of multi-gigabyte archives cannot hold every connection and starve discovery on the same host:
+
+```bash
+python infocon_scraper.py --dest "/path/to/drive" \
+  --metadata-connections 4 --transfer-connections 4
+```
+
+Concurrent large transfers are capped separately again. Files at least `--large-file-gib` (default 1) get their own budget of `--max-large-downloads` (default 2) slots, so reaching several huge archives at once cannot consume the whole download pool:
+
+```bash
+# Allow three concurrent large transfers, counting anything over 2 GiB as large
+python infocon_scraper.py --dest "/path/to/drive" \
+  --large-file-gib 2 --max-large-downloads 3
+```
+
+Completed downloads are SHA-256 hashed on a small background pool (`--hash-workers`, default 2) rather than in the download worker, since re-reading a multi-gigabyte file would otherwise hold a download slot for minutes after the transfer finished. Set `--hash-workers 0` to hash inline.
 
 The default HTTP settings already use bounded crawl/download pools and host concurrency limits. Increase `--workers` only when the source and disk can handle it; raising it too far can trigger remote connection timeouts rather than improving throughput.
 
@@ -366,7 +383,8 @@ The HTTP sync is built to survive interruptions and large runs:
 - **One writer per file.** Concurrent HTTP phases can discover the same file; only one worker is ever allowed to stage a given destination path, so two transfers can never share a `.part`.
 - **Bounded memory.** Download scheduling is capped (`--max-pending-downloads`, default `workers * 4`) so very large trees cannot accumulate hundreds of thousands of in-memory tasks.
 - **Disk-space guard.** A download that would leave less than `--min-free-gib` (default 1) free is refused, and a genuinely full destination halts the run cleanly instead of writing corrupt files.
-- **Periodic manifest saves.** The verification manifest is flushed every 200 completions, so a crash or power loss keeps most hash progress.
+- **Periodic manifest saves.** The verification manifest is flushed every 200 completions, so a crash or power loss keeps most hash progress. Size and modification time are recorded as soon as a download lands, before its hash is computed, so an interrupted run still keeps the fast path.
+- **Cheap refreshes.** A file whose local size and the listing's published modification time both match the manifest is skipped without any network request. Only files that look changed, unknown, or `--verify-all` cost a HEAD.
 - **Single-instance lock.** A `.infocon_scraper.lock` PID file under the destination prevents two syncs from racing on the same drive. Stale locks (dead PID) are reclaimed automatically; override with `--force`.
 - **Signal handling.** `SIGINT`/`SIGTERM` finish in-flight downloads, save the manifest, and release the lock.
 - **Corruption detection.** A local file whose recorded hash no longer matches is re-downloaded.
