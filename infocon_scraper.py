@@ -571,6 +571,65 @@ def _download_attempts(url: str, local_path: str, expected_size: int | None, par
     raise CurlError(f"download failed after {RUN.retries} attempts for {url}: {last_err}")
 
 
+# Directories an in-progress torrent is writing into. HTTP must not touch them:
+# libtorrent allocates files sparsely, so a half-downloaded file already reports
+# its FINAL size on disk. HTTP compares size against the directory listing to
+# decide "is this complete?", so a mostly-empty file passes, gets hashed, and is
+# recorded as good forever - and re-downloading it in parallel would corrupt the
+# torrent's own writes. Ownership is released when a torrent completes or is
+# handed to the HTTP fallback.
+_torrent_paths: set[str] = set()
+_torrent_paths_lock = threading.Lock()
+
+
+def claim_torrent_path(directory: str) -> None:
+    with _torrent_paths_lock:
+        _torrent_paths.add(os.path.normpath(directory))
+
+
+def release_torrent_path(directory: str) -> None:
+    with _torrent_paths_lock:
+        _torrent_paths.discard(os.path.normpath(directory))
+
+
+def is_torrent_owned(local_path: str) -> bool:
+    """True while an in-progress torrent owns the file's directory."""
+    path = os.path.normpath(local_path)
+    with _torrent_paths_lock:
+        if not _torrent_paths:
+            return False
+        owned = tuple(_torrent_paths)
+    return any(path == d or path.startswith(d + os.sep) for d in owned)
+
+
+def _reset_torrent_paths() -> None:
+    """Test hook."""
+    with _torrent_paths_lock:
+        _torrent_paths.clear()
+
+
+SPARSE_ALLOCATION_RATIO = 0.95
+
+
+def looks_incomplete(local_path: str, expected_size: int | None) -> bool:
+    """True when a file claims the right size but is not actually filled in.
+
+    libtorrent writes sparse files, so an interrupted torrent leaves a
+    full-size file containing holes. Size alone cannot tell it apart from a
+    finished download; allocated blocks can.
+    """
+    if not expected_size:
+        return False
+    try:
+        st = os.stat(local_path)
+    except OSError:
+        return False
+    if st.st_size != expected_size and abs(st.st_size - expected_size) > 0:
+        return False
+    allocated = st.st_blocks * 512
+    return allocated < st.st_size * SPARSE_ALLOCATION_RATIO
+
+
 # Guards against two workers writing the same destination file at once. The
 # duplicate crawls that used to make this happen are fixed at the source, but a
 # collision here silently corrupts a .part and then fails its rename, so the
@@ -1207,6 +1266,12 @@ def _sync_one_file(item: RemoteFile, local_path: str, manifest: Manifest,
         log.info("Skipping %s (already have the unpacked folder)", rel)
         return "skip-duplicate-archive", 0
 
+    if is_torrent_owned(local_path):
+        # A torrent is fetching this right now, with piece-level verification.
+        # Fetching it again over HTTP would duplicate the transfer and race the
+        # torrent's own writes on the same file.
+        return "skip-torrent-owned", 0
+
     exists = os.path.exists(local_path)
     local_size = os.path.getsize(local_path) if exists else 0
     entry = manifest.get(rel)
@@ -1229,6 +1294,14 @@ def _sync_one_file(item: RemoteFile, local_path: str, manifest: Manifest,
         except CurlError as exc:
             log.error("HEAD failed for %s: %s", item.url, exc)
             return "error", 0
+
+    if exists and looks_incomplete(local_path, local_size):
+        # Full-size but unfilled: an abandoned torrent's sparse file. Its bytes
+        # are unusable and the host cannot resume, so start clean.
+        log.warning("Discarding partially written %s (only %.0f%% allocated)", rel,
+                    100.0 * os.stat(local_path).st_blocks * 512 / max(1, local_size))
+        _safe_remove(local_path)
+        exists, local_size = False, 0
 
     if exists and expected_size is not None and abs(local_size - expected_size) <= slack:
         if entry and entry.get("size") == local_size and not verify_all:

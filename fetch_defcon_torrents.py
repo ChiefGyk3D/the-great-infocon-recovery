@@ -509,6 +509,26 @@ def load_add_params(spec: TorrentSpec, info, resume_dir: str):
     return atp
 
 
+def _claim_content(directory: str) -> None:
+    """Tell the HTTP sync that a torrent owns this directory.
+
+    Imported lazily so the helper still runs standalone without the scraper.
+    """
+    try:
+        from infocon_scraper import claim_torrent_path
+    except ImportError:  # pragma: no cover - standalone use
+        return
+    claim_torrent_path(directory)
+
+
+def _release_content(directory: str) -> None:
+    try:
+        from infocon_scraper import release_torrent_path
+    except ImportError:  # pragma: no cover
+        return
+    release_torrent_path(directory)
+
+
 def handle_key(handle) -> str:
     """Stable identity for a torrent handle, used to route resume alerts.
 
@@ -756,6 +776,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     selected_names: set[str] = set()
     # Completed torrents currently sharing back to the swarm.
     seeding_names: set[str] = set()
+    # Content directory each torrent is writing into, claimed against HTTP.
+    content_dirs: dict[str, str] = {}
 
     resume_dir = os.path.join(torrents_dir, "resume")
     resume_targets: dict[str, str] = {}
@@ -791,6 +813,10 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
             handle = ses.add_torrent(load_add_params(spec, info, resume_dir))
             handles[spec.name] = handle
             resume_targets[handle_key(handle)] = resume_file_path(resume_dir, spec)
+            # Claim the content directory so the HTTP sync stands off it while
+            # this torrent writes sparse files into it.
+            content_dirs[spec.name] = os.path.join(spec.save_path, info.name())
+            _claim_content(content_dirs[spec.name])
             resumed = os.path.exists(resume_file_path(resume_dir, spec))
             print(f"Added {spec.name}: {info.total_size() / 1e9:.2f} GB, {info.num_files()} files"
                   f"{' (fast resume)' if resumed else ''}")
@@ -845,6 +871,9 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                 ):
                     done += 1
                     completed_at.setdefault(name, time.time())
+                    if name in content_dirs:
+                        # Verified by piece hash; HTTP may now inspect it.
+                        _release_content(content_dirs.pop(name))
                     seeded_for = time.time() - completed_at[name]
                     if settings.seed_time == 0:
                         if s.state != lt.torrent_status.paused:
@@ -873,6 +902,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                             if quiet_for >= settings.stalled_minutes * 60:
                                 stalled_names.add(name)
                                 h.pause()
+                                if name in content_dirs:
+                                    _release_content(content_dirs.pop(name))
                                 print(f"Stalled after {quiet_for / 60:.0f} minutes; handing {name} back to HTTP.")
                                 stalled_callback(specs_by_name[name])
                                 continue
