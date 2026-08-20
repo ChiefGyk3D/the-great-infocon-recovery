@@ -1330,6 +1330,9 @@ def run_defcon_torrent_step(dest_root: str, only: list[str] | None, args: argpar
         listen_interface="0.0.0.0:6881",
         poll_seconds=args.torrent_poll_seconds,
         seed_time=args.torrent_seed_time,
+        seed_upload_slots=max(0, args.torrent_seed_upload_slots),
+        seed_rate_limit_kib=max(0, args.torrent_seed_rate_limit),
+        max_seeding=max(1, args.torrent_max_seeding),
         enable_dht=True,
         enable_pex=True,
         enable_lsd=True,
@@ -1820,8 +1823,16 @@ def main() -> int:
     parser.add_argument("--torrent-resume-save-minutes", type=int, default=5,
                          help="Minutes between fast-resume checkpoints so a restart skips re-hashing "
                               "already-verified content (default: 5)")
-    parser.add_argument("--torrent-seed-time", type=int, default=0,
-                         help="If --with-torrents is set, minutes to seed after completion (default: 0)")
+    parser.add_argument("--torrent-seed-time", type=int, default=60,
+                         help="If --with-torrents is set, minutes to keep sharing each archive after it "
+                              "completes; 0 stops seeding immediately, negative seeds until the run is "
+                              "stopped (default: 60)")
+    parser.add_argument("--torrent-seed-upload-slots", type=int, default=4,
+                         help="How many peers may download from you at once (default: 4)")
+    parser.add_argument("--torrent-seed-rate-limit", type=int, default=0,
+                         help="Upload cap in KiB/s while seeding; 0 is unlimited (default: 0)")
+    parser.add_argument("--torrent-max-seeding", type=int, default=20,
+                         help="Maximum archives seeding at once (default: 20)")
     parser.add_argument("--torrent-stalled-minutes", type=int, default=30,
                          help="If --with-torrents is set, hand zero-peer/zero-rate torrents to HTTP after this many minutes (default: 30)")
     parser.add_argument("--torrent-defcon-only", default="30,31,32,33,34",

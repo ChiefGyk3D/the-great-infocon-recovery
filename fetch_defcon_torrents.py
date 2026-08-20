@@ -116,6 +116,13 @@ class TorrentSettings:
     # every incomplete torrent every cycle: at 293 torrents on a 10s poll that
     # is ~2,500 log lines a minute, and it dominated the run log.
     status_lines: int = 10
+    # Seeding. The archive asks contributors to help grow it, and a rebuilt
+    # drive is a fully-populated seed, so the tool gives back by default.
+    # upload_slots is how many peers may download from us at once; rate_limit
+    # caps the bandwidth that costs, in KiB/s (0 = unlimited).
+    seed_upload_slots: int = 4
+    seed_rate_limit_kib: int = 0
+    max_seeding: int = 20
     # Minutes between resume-data checkpoints. Without resume data every restart
     # re-hash-checks the whole set before a single byte can transfer.
     resume_save_minutes: int = 5
@@ -136,12 +143,21 @@ def build_libtorrent_session(settings: TorrentSettings) -> lt.session:
     non-existent setting key.
     """
     limit = settings.max_active if settings.max_active > 0 else -1
+    seeds = settings.max_seeding if settings.max_seeding > 0 else -1
     session_settings = lt.default_settings()
     session_settings["listen_interfaces"] = settings.listen_interface
     session_settings["active_downloads"] = limit
-    session_settings["active_seeds"] = limit
-    session_settings["active_limit"] = limit
+    session_settings["active_seeds"] = seeds
+    # active_limit covers downloads and seeds together. Leaving it at the
+    # download limit would make every seeding torrent compete for a download
+    # slot, so a drive that finished an archive could not share it.
+    session_settings["active_limit"] = -1 if (limit < 0 or seeds < 0) else limit + seeds
     session_settings["connections_limit"] = settings.connections
+    # How many peers may pull from us at once, and at what cost.
+    if "unchoke_slots_limit" in session_settings:
+        session_settings["unchoke_slots_limit"] = max(0, settings.seed_upload_slots)
+    if "upload_rate_limit" in session_settings:
+        session_settings["upload_rate_limit"] = max(0, settings.seed_rate_limit_kib) * 1024
     # Resume-data checkpoints arrive as alerts, so the storage category has to
     # be enabled for them to be delivered at all.
     if "alert_mask" in session_settings:
@@ -738,6 +754,8 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
     # by us on purpose and would otherwise report zero peers / zero rate and be
     # handed to HTTP within `stalled_minutes` of checking finishing.
     selected_names: set[str] = set()
+    # Completed torrents currently sharing back to the swarm.
+    seeding_names: set[str] = set()
 
     resume_dir = os.path.join(torrents_dir, "resume")
     resume_targets: dict[str, str] = {}
@@ -802,10 +820,14 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
         checking_complete = False
         scheduler_locked = False
         last_resume_request = time.time()
+        announced_complete = False
         while True:
             done = 0
             active = []
             checking = False
+            upload_rate = 0
+            peers_served = 0
+            seeding_names.clear()
             for name, h in handles.items():
                 if name in stalled_names:
                     continue
@@ -823,8 +845,21 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
                 ):
                     done += 1
                     completed_at.setdefault(name, time.time())
-                    if settings.seed_time == 0 and s.state != lt.torrent_status.paused or settings.seed_time > 0 and time.time() - completed_at[name] >= settings.seed_time * 60:
-                        h.pause()
+                    seeded_for = time.time() - completed_at[name]
+                    if settings.seed_time == 0:
+                        if s.state != lt.torrent_status.paused:
+                            h.pause()
+                    elif settings.seed_time > 0 and seeded_for >= settings.seed_time * 60:
+                        if s.state != lt.torrent_status.paused:
+                            print(f"Seeded {name} for {settings.seed_time} minutes; pausing.")
+                            h.pause()
+                    else:
+                        # Still within the seed window, or seeding until stopped.
+                        if s.state == lt.torrent_status.paused:
+                            h.resume()
+                        seeding_names.add(name)
+                        upload_rate += s.upload_rate
+                        peers_served += s.num_peers
                 else:
                     if not _wants_to_download(name, s, selected_names):
                         # Queued behind the active-torrent limit (or paused for
@@ -876,9 +911,13 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
             total_rate = sum(a[0] for a in active)
             downloading = sum(1 for a in active if a[0] > 0)
             waiting = len(queued_specs)
+            seeding_note = ""
+            if settings.seed_time != 0 and seeding_names:
+                seeding_note = (f" | seeding {len(seeding_names)} to {peers_served} peer(s) "
+                                f"at {upload_rate / 1e6:.2f} MB/s up")
             print(f"--- {done}/{total_specs - skipped_specs} complete | {total_rate / 1e6:6.2f} MB/s total | "
                   f"{downloading} active, {len(active) - downloading} queued/idle, "
-                  f"{waiting} not yet admitted ---")
+                  f"{waiting} not yet admitted{seeding_note} ---")
             # Detail lines are capped: printing every incomplete torrent each
             # poll produced thousands of log lines a minute and buried
             # everything else in the run log.
@@ -910,8 +949,15 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
 
             target_count = len(handles) - len(stalled_names)
             if done == target_count and not queued_specs:
-                print("All requested DEF CON items fully downloaded and verified.")
-                break
+                stopping = stop_event is not None and stop_event.is_set()
+                if settings.seed_time < 0 and not stopping:
+                    if not announced_complete:
+                        announced_complete = True
+                        print("All requested DEF CON items fully downloaded and verified; "
+                              "seeding until stopped (--seed-time 0 to exit on completion).")
+                else:
+                    print("All requested DEF CON items fully downloaded and verified.")
+                    break
             if stop_event is not None and stop_event.is_set():
                 print("Stop requested; pausing torrents and checkpointing resume data.")
                 break
@@ -975,8 +1021,18 @@ def main() -> int:
     parser.add_argument("--resume-save-minutes", type=int, default=5,
                         help="Minutes between fast-resume checkpoints, which let a restart skip "
                              "re-hashing verified content (default: 5)")
-    parser.add_argument("--seed-time", type=int, default=0,
-                         help="Minutes to seed after completion; 0 disables seeding")
+    parser.add_argument("--seed-time", type=int, default=60,
+                         help="Minutes to keep sharing each archive after it completes. "
+                              "0 stops seeding the moment a torrent finishes; a negative value "
+                              "seeds until the run is stopped (default: 60). The archive is "
+                              "community-hosted and asks contributors to help it grow, so a "
+                              "rebuilt drive shares back by default.")
+    parser.add_argument("--seed-upload-slots", type=int, default=4,
+                        help="How many peers may download from you at once (default: 4)")
+    parser.add_argument("--seed-rate-limit", type=int, default=0,
+                        help="Upload cap in KiB/s while seeding; 0 is unlimited (default: 0)")
+    parser.add_argument("--max-seeding", type=int, default=20,
+                        help="Maximum archives seeding at once (default: 20)")
     parser.add_argument("--stalled-minutes", type=int, default=30,
                         help="Minutes with zero peers and zero download rate before combined mode hands an item to HTTP (default: 30)")
     parser.add_argument("--no-dht", action="store_true", help="Disable the distributed hash table")
@@ -1003,7 +1059,7 @@ def main() -> int:
         connections=args.connections,
         listen_interface=args.listen_interface,
         poll_seconds=max(1, args.poll_seconds),
-        seed_time=max(0, args.seed_time),
+        seed_time=args.seed_time,
         enable_dht=not args.no_dht,
         enable_pex=not args.no_pex,
         enable_lsd=not args.no_lsd,
@@ -1016,6 +1072,9 @@ def main() -> int:
         torrent_order=args.torrent_order,
         status_lines=max(0, args.status_lines),
         resume_save_minutes=max(1, args.resume_save_minutes),
+        seed_upload_slots=max(0, args.seed_upload_slots),
+        seed_rate_limit_kib=max(0, args.seed_rate_limit),
+        max_seeding=max(1, args.max_seeding),
     )
     return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip,
                      include_mirrors=args.include_mirrors,
