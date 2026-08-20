@@ -295,6 +295,34 @@ Per-torrent detail lines are capped at `--status-lines` (default 10, `--torrent-
 
 Torrents are admitted to the session a window at a time rather than all at once, so a large set does not hash-check every archive simultaneously against one disk.
 
+### Sharing Back
+
+A rebuilt drive is a fully populated seed, and the archive is community-hosted - its own Rainbow Tables README asks contributors to "help us grow our archive". Completed archives are therefore shared back by default rather than dropped the moment the last piece lands.
+
+Seeding is bounded by explicit limits so it never competes with the work still in progress:
+
+| Option | Default | Meaning |
+| --- | ---: | --- |
+| `--seed-time` | 60 | Minutes to keep sharing each archive after it completes. `0` stops immediately; a negative value seeds until the run is stopped. |
+| `--seed-upload-slots` | 4 | How many peers may download from you at once. |
+| `--seed-rate-limit` | 0 | Upload cap in KiB/s; `0` is unlimited. |
+| `--max-seeding` | 20 | Maximum archives seeding concurrently. |
+
+```bash
+# Share generously from a machine with spare uplink
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --seed-time -1 --seed-upload-slots 12
+
+# Contribute without disturbing anything else on the connection
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --seed-rate-limit 2048 --seed-upload-slots 2
+
+# Opt out entirely
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" --seed-time 0
+```
+
+Combined mode exposes the same controls as `--torrent-seed-time`, `--torrent-seed-upload-slots`, `--torrent-seed-rate-limit`, and `--torrent-max-seeding`. Seeding torrents no longer consume download slots: `active_limit` covers downloads and seeds separately, so finishing an archive does not slow the ones still arriving. The status line reports what you are giving back, e.g. `seeding 6 to 14 peer(s) at 3.21 MB/s up`.
+
 Fast-resume data is checkpointed every `--resume-save-minutes` (default 5) and again on exit, including after `Ctrl+C`. Without it every restart re-hash-checks the entire set - terabytes on a populated drive - before anything can transfer. Checkpoints live under the torrent cache directory, so relocating the cache with `--torrents-dir` or `INFOCON_TORRENTS_CACHE` moves them too.
 
 ### Combined Torrent and HTTP Mode
