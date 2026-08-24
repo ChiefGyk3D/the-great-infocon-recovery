@@ -30,11 +30,22 @@ while :; do
         /^--- [0-9]+\/[0-9]+ complete/ {
             summary=$0
             count=0
+            truncated=""
             delete torrent_lines
             next
         }
-        /^DEF CON .*: +[0-9.]+%/ {
+        # Any archive, not just DEF CON: 289 of the 293 torrents in the online
+        # inventory are other InfoCon conferences, and matching "^DEF CON "
+        # made the pane report "none currently downloading" while the summary
+        # line above it said otherwise.
+        /: +[0-9.]+% +down +[0-9.]+ MB\/s/ {
             torrent_lines[++count]=$0
+            next
+        }
+        # The scraper caps per-torrent detail lines and summarises the rest.
+        /^\.\.\. and [0-9]+ more/ {
+            truncated=$0
+            next
         }
         END {
             if (summary == "") {
@@ -70,13 +81,16 @@ while :; do
             if (idle_count > shown_idle) {
                 printf "\n... %d more checking/queued not shown\n", idle_count - shown_idle
             }
+            if (truncated != "") {
+                printf "\n%s\n", truncated
+            }
         }
     ' "$LOG" 2>/dev/null
 
     printf '\nState counts from latest block:\n'
     awk '
         /^--- [0-9]+\/[0-9]+ complete/ {capture=1; delete states; next}
-        capture && /^DEF CON .*: +[0-9.]+%/ {
+        capture && /: +[0-9.]+% +down +[0-9.]+ MB\/s/ {
             line=$0
             sub(/^.*state /, "", line)
             states[line]++
