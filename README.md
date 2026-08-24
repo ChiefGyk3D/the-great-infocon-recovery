@@ -143,6 +143,85 @@ conference directories and does *not* include DEF CON, even though
 `cons/` crawl therefore never descends into it. The `defcon` dataset keeps its
 own root for this reason; drop it and Drive A silently loses 1.77 TB.
 
+#### Preparing the drive itself
+
+```bash
+python infocon_scraper.py --ddv-format-help                    # compare the options
+python infocon_scraper.py --ddv A --ddv-format-help ext4 --ddv-device /dev/sdb
+```
+
+**The Data Duplication Village ships NTFS, not ext4.** The village drives have
+to be readable by whoever plugs them in — Windows, macOS and Linux alike — and
+NTFS is the only format all three can at least read natively. A drive you build
+as ext4 holds identical bytes but is not a drop-in replacement for a village
+drive.
+
+This project is developed and run primarily on Linux, so ext4 is the default
+recommendation for a drive that stays on your own machine. Choose deliberately:
+
+|  | case | journal | Linux | Windows | macOS |
+| --- | --- | --- | --- | --- | --- |
+| **ext4** | sensitive | yes | read/write | extra software | extra software |
+| **NTFS** | insensitive | yes | read/write (ntfs-3g / ntfs3) | read/write | read-only |
+| **exFAT** | insensitive | **no** | read/write | read/write | read/write |
+
+- **ext4** — best on a Linux-only machine. Journaled, case-sensitive like the
+  archive itself, and quick to check after a power loss.
+- **NTFS** — matches the DDV. Pick this if anyone else has to read the drive.
+  `ntfs-3g` is FUSE and noticeably slower across hundreds of thousands of small
+  files; the in-kernel `ntfs3` driver is faster.
+- **exFAT** — the most portable, and the only one all three systems *write*
+  natively. But it has no journal, so an interrupted write can cost the
+  filesystem rather than just the file in flight. Across a multi-day transfer,
+  that is a real risk, not a theoretical one.
+
+None of the three imposes a 4 GB file limit, which matters: `word lists` ships
+single archives over 9 GB. FAT32 is not an option.
+
+##### Case sensitivity is not the trap it looks like
+
+A long-lived mirror accumulates paths differing only in case — `44Con` beside
+`44CON` — as upstream renames things, and those would collide on NTFS or exFAT.
+Sampling those pairs against the live archive, **every one had exactly one
+variant still published**. The archive itself is collision-free; the duplicates
+are stale local copies of directories that were renamed years ago.
+
+So NTFS and exFAT are safe for a *fresh* build. They are only a problem when
+copying an old tree forward, which is a reason to reconcile before copying, not
+a reason to avoid those filesystems.
+
+##### What the generated commands do
+
+`--ddv-format-help <fs> --ddv-device /dev/sdX` prints the exact partition, mkfs
+and mount commands. **Nothing is ever executed** — picking the wrong block
+device is unrecoverable, so running them stays your decision. The output always
+leads with `lsblk` so you can confirm the target first.
+
+Two ext4 flags are worth understanding, because the defaults are wrong for this
+workload:
+
+```bash
+sudo mkfs.ext4 -m 0 -N 1600000 -L infocon /dev/sdb1
+```
+
+- **`-m 0`** drops the 5% reserve ext4 withholds for root. On a 6 TB drive that
+  is roughly 300 GB — on a dataset that already overflows its nominal capacity.
+- **`-N 1600000`** sets the inode count from the drive's real file count rather
+  than the default one-inode-per-16 KiB. Drive A holds 529,489 files averaging
+  12 MB; the default would provision ~366 million inodes and spend about
+  **98 GB** on tables that stay empty. The number is computed per selection, so
+  Drive F (4,098 files averaging 1.2 GB) gets a far smaller one.
+
+The NTFS mount line includes `windows_names`, which refuses filenames Windows
+could not represent. Without it the drive only *looks* portable.
+
+##### Cross-platform builds
+
+NTFS and exFAT are supported today through `--ddv-format-help`. Deeper
+cross-platform work — verifying a completed drive actually mounts clean on
+Windows and macOS, and handling the filename normalisation each does
+differently — is not done yet.
+
 #### Keep the datasets on separate trees
 
 Drives B, C, E and F are hash tables and are excluded from the default crawl and
