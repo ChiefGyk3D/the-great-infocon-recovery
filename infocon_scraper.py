@@ -68,6 +68,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 from bs4 import BeautifulSoup
 
 import ddv_profiles
+import drive_setup
 
 # infocon.org's WAF resets connections made with Python's TLS stack
 # (requests/urllib3/urllib all get RemoteDisconnected), but the system
@@ -1829,6 +1830,17 @@ def main() -> int:
     parser.add_argument("--ddv-dataset", default=None,
                          help="Comma-separated individual DDV datasets to rebuild, e.g. 'md5,ntlm', for "
                               "mixing and matching across drives. Combines with --ddv. See --ddv-list.")
+    parser.add_argument("--ddv-format-help", nargs="?", const="", default=None,
+                         metavar="FS",
+                         help="Print filesystem guidance for building a DDV drive, then exit. "
+                              "With no value it compares ext4, NTFS and exFAT; with "
+                              "ext4|ntfs|exfat (and --ddv-device) it prints the exact "
+                              "partition, mkfs and mount commands. Nothing is ever run for "
+                              "you. Combine with --ddv/--ddv-dataset to size the filesystem "
+                              "from that drive's real file count.")
+    parser.add_argument("--ddv-device", default=None, metavar="/dev/sdX",
+                         help="Target whole-disk device for --ddv-format-help, e.g. /dev/sdb. "
+                              "Used only to render commands; nothing is written to it.")
     parser.add_argument("--ddv-no-preflight", action="store_true",
                          help="Skip the DDV free-space pre-flight check (it otherwise refuses to start a "
                               "transfer that cannot fit)")
@@ -1959,6 +1971,20 @@ def main() -> int:
     # destination drive attached.
     if args.ddv_list:
         print(ddv_profiles.format_catalog())
+        return 0
+
+    if args.ddv_format_help is not None:
+        try:
+            print(drive_setup.format_help(
+                drives=[d.strip() for d in args.ddv.split(",") if d.strip()] if args.ddv else None,
+                datasets=[d.strip() for d in args.ddv_dataset.split(",") if d.strip()]
+                if args.ddv_dataset else None,
+                fs_key=args.ddv_format_help or None,
+                device=args.ddv_device,
+            ))
+        except KeyError as exc:
+            print(exc.args[0])
+            return 2
         return 0
 
     if not args.dest:
