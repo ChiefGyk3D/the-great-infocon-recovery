@@ -67,6 +67,8 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+import ddv_profiles
+
 # infocon.org's WAF resets connections made with Python's TLS stack
 # (requests/urllib3/urllib all get RemoteDisconnected), but the system
 # `curl` binary works fine. All HTTP is therefore shelled out to curl.
@@ -1804,7 +1806,9 @@ def run_aria2c_torrent(torrent_path: str, download_dir: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Mirror the InfoCon.org archive to a local drive.")
-    parser.add_argument("--dest", required=True, help="Local destination root (e.g. your InfoCon drive mount point)")
+    parser.add_argument("--dest", default=None,
+                        help="Local destination root (e.g. your InfoCon drive mount point). "
+                             "Required except with --ddv-list.")
     parser.add_argument("--base-url", default=DEFAULT_ROOT_URL, help="Root URL of the InfoCon.org site")
     parser.add_argument("--defcon-media-url", default=DEFCON_MEDIA_ROOT_URL,
                          help="Root URL of media.defcon.org (DEF CON's own authoritative media server)")
@@ -1814,6 +1818,20 @@ def main() -> int:
                             "Default: infocon,defcon-media. DEF CON folders that already have a torrent are "
                             "auto-skipped (grab those with fetch_defcon_torrents.py); HTTP crawls everything "
                             "else, including the torrentless remainder such as DEF CON 34.")
+    parser.add_argument("--ddv-list", action="store_true",
+                         help="Print the DEF CON Data Duplication Village source-drive profiles - every "
+                              "drive, the datasets it carries, their sizes, and whether they still fit the "
+                              "drive they are nominally sold for - then exit")
+    parser.add_argument("--ddv", default=None,
+                         help="Comma-separated DDV drive letters to rebuild, e.g. 'A' or 'B,C'. Selects "
+                              "exactly the datasets that drive carries and pre-flights the free space at "
+                              "--dest. See --ddv-list.")
+    parser.add_argument("--ddv-dataset", default=None,
+                         help="Comma-separated individual DDV datasets to rebuild, e.g. 'md5,ntlm', for "
+                              "mixing and matching across drives. Combines with --ddv. See --ddv-list.")
+    parser.add_argument("--ddv-no-preflight", action="store_true",
+                         help="Skip the DDV free-space pre-flight check (it otherwise refuses to start a "
+                              "transfer that cannot fit)")
     parser.add_argument("--only-cons", default=None,
                          help="Comma-separated substrings to restrict which infocon.org cons/ conferences are "
                               "synced (default: all conferences)")
@@ -1937,6 +1955,15 @@ def main() -> int:
                               "media.defcon.org use fetch_defcon_torrents.py instead")
     args = parser.parse_args()
 
+    # --ddv-list is a catalog query, not a transfer, so it must work without a
+    # destination drive attached.
+    if args.ddv_list:
+        print(ddv_profiles.format_catalog())
+        return 0
+
+    if not args.dest:
+        parser.error("--dest is required (except with --ddv-list)")
+
     if args.list_torrents:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         cons_url = urljoin(args.base_url, "cons/")
@@ -1993,12 +2020,62 @@ def main() -> int:
     defcon_media_skip = {f.strip() for f in args.defcon_media_skip.split(",") if f.strip()} \
         if args.defcon_media_skip else None
     sources = [s.strip() for s in args.sources.split(",") if s.strip()]
+    ddv_roots: list[str] = []
+
+    if args.ddv or args.ddv_dataset:
+        # A DDV profile IS the selection. Letting it silently merge with a
+        # hand-rolled --only-top would produce a drive that matches neither.
+        conflicting = [name for name, value in (("--only-cons", args.only_cons),
+                                                ("--only-top", args.only_top),
+                                                ("--only-mirrors", args.only_mirrors))
+                       if value]
+        if conflicting:
+            log.error("--ddv/--ddv-dataset already select content; remove %s or drop the DDV flags.",
+                      " and ".join(conflicting))
+            return 2
+        try:
+            selected = ddv_profiles.resolve(
+                [d.strip() for d in args.ddv.split(",") if d.strip()] if args.ddv else None,
+                [d.strip() for d in args.ddv_dataset.split(",") if d.strip()] if args.ddv_dataset else None,
+            )
+        except KeyError as exc:
+            log.error("%s", exc.args[0])
+            return 2
+
+        for line in ddv_profiles.format_plan(selected, args.dest).splitlines():
+            log.info("%s", line)
+
+        if not args.ddv_no_preflight:
+            ok, message = ddv_profiles.preflight(selected, args.dest)
+            if not ok:
+                log.error("Refusing to start: %s", message)
+                log.error("Attach a larger drive, drop a dataset, or pass --ddv-no-preflight.")
+                return 2
+
+        plan = ddv_profiles.merge_selections(selected)
+        sources = list(plan.sources) or sources
+        only_top = list(plan.only_top) or None
+        only_cons = list(plan.only_cons) or None
+        only_mirrors = list(plan.only_mirrors) or None
+        # Every hash table is one directory *inside* 'rainbow tables', which
+        # --only-top cannot express: selecting Drive B by section would crawl
+        # all 22.8 TB of tables instead of its 5.8 TB. The profile's exact
+        # paths become the roots directly.
+        ddv_roots = list(plan.paths)
+        if plan.include_rainbow_tables:
+            args.torrent_include_rainbow_tables = True
+        if plan.include_mirrors:
+            args.torrent_include_mirrors = True
 
     log.info("Discovering content from sources: %s ...", ", ".join(sources))
-    roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip,
-                        only_cons, only_top, only_mirrors,
-                        skip_torrented=not args.no_skip_torrented,
-                        torrent_skip_names=skip_recent)
+    if ddv_roots:
+        roots = [(urljoin(args.base_url, quote(path.strip("/")) + "/"), path.strip("/"))
+                 for path in ddv_roots]
+    else:
+        roots = build_roots(sources, args.base_url, args.defcon_media_url, defcon_media_skip,
+                            only_cons, only_top, only_mirrors,
+                            skip_torrented=not args.no_skip_torrented,
+                            torrent_skip_names=skip_recent)
     log.info("Target sections (priority order): %s", ", ".join(rel for _, rel in roots))
     def is_defcon_root(root: tuple[str, str]) -> bool:
         return root[1].lower().startswith("cons/def con")
