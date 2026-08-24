@@ -44,6 +44,8 @@ from urllib.parse import unquote, urljoin
 import libtorrent as lt
 from bs4 import BeautifulSoup
 
+import ddv_profiles
+
 TORRENTS_DIR_URL = "https://media.defcon.org/DEF%20CON%20Torrents/"
 INFOCON_ROOT_URL = "https://infocon.org/"
 USER_AGENT = "InfoConDriveSync/1.0 (personal archive sync tool)"
@@ -1174,7 +1176,18 @@ def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch/verify DEF CON archives via BitTorrent v2 (libtorrent).")
-    parser.add_argument("--dest", required=True, help="Destination cons/DEF CON directory")
+    parser.add_argument("--dest", default=None,
+                        help="Destination cons/DEF CON directory. Required except with --ddv-list.")
+    parser.add_argument("--ddv-list", action="store_true",
+                        help="Print the DEF CON Data Duplication Village source-drive profiles and exit")
+    parser.add_argument("--ddv", default=None,
+                        help="Comma-separated DDV drive letters to rebuild via BitTorrent, e.g. 'B'. "
+                             "The hash-table drives (B, C, E, F) are torrent-first: the publisher asks "
+                             "for torrents and they carry web seeds. See --ddv-list.")
+    parser.add_argument("--ddv-dataset", default=None,
+                        help="Comma-separated individual DDV datasets to rebuild, e.g. 'md5,ntlm'")
+    parser.add_argument("--ddv-no-preflight", action="store_true",
+                        help="Skip the DDV free-space pre-flight check")
     parser.add_argument("--force", action="store_true",
                          help="Override the shared drive-level lock and run anyway")
     parser.add_argument("--verify-only", action="store_true",
@@ -1252,6 +1265,13 @@ def main() -> int:
                          help="Seconds between metadata retries (default: 3)")
     args = parser.parse_args()
 
+    if args.ddv_list:
+        print(ddv_profiles.format_catalog())
+        return 0
+
+    if not args.dest:
+        parser.error("--dest is required (except with --ddv-list)")
+
     lock_path = shared_drive_lock_path(args.dest)
     if not acquire_lock(lock_path, force=args.force):
         print(f"Another sync appears to be running for the same drive root (lock: {lock_path}). Use --force to override.")
@@ -1260,6 +1280,39 @@ def main() -> int:
     only = [f.strip() for f in args.only.split(",") if f.strip()] if args.only else None
     skip = [f.strip() for f in args.skip.split(",") if f.strip()] if args.skip else None
     defcon_only = [f.strip() for f in args.defcon_only.split(",") if f.strip()] if args.defcon_only else None
+
+    if args.ddv or args.ddv_dataset:
+        if args.only:
+            print("--ddv/--ddv-dataset already select content; remove --only or drop the DDV flags.")
+            return 2
+        try:
+            selected = ddv_profiles.resolve(
+                [d.strip() for d in args.ddv.split(",") if d.strip()] if args.ddv else None,
+                [d.strip() for d in args.ddv_dataset.split(",") if d.strip()] if args.ddv_dataset else None,
+            )
+        except KeyError as exc:
+            print(exc.args[0])
+            return 2
+
+        print(ddv_profiles.format_plan(selected, args.dest))
+        if not args.ddv_no_preflight:
+            ok, message = ddv_profiles.preflight(selected, args.dest)
+            if not ok:
+                print(f"Refusing to start: {message}")
+                print("Attach a larger drive, drop a dataset, or pass --ddv-no-preflight.")
+                return 2
+
+        plan = ddv_profiles.merge_selections(selected)
+        # Match on the publisher's torrent names ("NTLM rainbow tables v2 -
+        # infocon.org.torrent"), which identify a dataset exactly. Matching on
+        # directory names instead would pull NTLM 9 in with NTLM.
+        only = list(plan.torrent_names) or None
+        if plan.include_rainbow_tables:
+            args.include_rainbow_tables = True
+        if plan.include_mirrors:
+            args.include_mirrors = True
+        if plan.defcon_only and not defcon_only:
+            defcon_only = list(plan.defcon_only)
     settings = TorrentSettings(
         max_active=args.max_active,
         connections=args.connections,

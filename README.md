@@ -28,6 +28,8 @@ This project is licensed under the GNU General Public License v3.0. See [LICENSE
 
 The enormous `mirrors/` tree is excluded by default because repositories such as vx-underground can consume an entire disk. Include it explicitly with `--only-top mirrors`.
 
+`ddv_profiles.py` maps all six DEF CON Data Duplication Village source drives onto the archive, so you can rebuild any of them — or mix datasets across them — without working out the layout yourself. Start with `python infocon_scraper.py --ddv-list`; see [DDV Source-Drive Profiles](#ddv-source-drive-profiles).
+
 ### InfoCon Mirrors
 
 `https://infocon.org/mirrors/` contains independent historical or community archive collections. The current top-level listing includes:
@@ -45,32 +47,143 @@ The enormous `mirrors/` tree is excluded by default because repositories such as
 
 Sizes and availability can change. Check the live listing before starting a large transfer. The mirror archives are independent collections, not alternate copies of the normal `cons/` conference folders.
 
-### DDV Source-Drive Relationship
+### DDV Source-Drive Profiles
 
-The current six-drive DDV layout is:
+Every year the DEF CON Data Duplication Village hands out a set of source drives
+that attendees queue up to copy. All of that content is published on
+infocon.org, so anyone can rebuild any of those drives from home. The hard part
+was never access — it was knowing *which* slice of a 37 TB archive belongs on
+which drive, and whether what you picked will actually fit.
 
-| Drive | Capacity | Contents | This project's coverage |
-| --- | ---: | --- | --- |
-| A | 6 TB | 2026 InfoCon.org archive | Primary target of `infocon_scraper.py` |
-| B | 6 TB | Lanman, MSSQL, and NTLM hash tables | Separate companion dataset |
-| C | 6 TB | A5/1, GSM, and MD5 hash tables | Separate companion dataset |
-| D | 8 TB | VX Underground archive, latest papers, samples, and code | Available through the relevant `mirrors/vx underground .../` collections |
-| E | 8 TB | NTLM-9 hash tables | Separate companion dataset |
-| F | 6 TB | 4.2 Net NTLMv1 rainbow table | Separate companion dataset |
+`ddv_profiles.py` is that map, and both tools can be driven from it directly.
 
-Drive A is the InfoCon archive this project rebuilds so people can recover the conference archive even when they cannot attend DEF CON in person. Drive D's VX Underground material is represented by the relevant mirror collections described below. Drives B, C, E, and F are separate hash-table datasets and are not automatically supplied by `infocon_scraper.py`; keep them in their own destination trees rather than combining them with the InfoCon mirror.
-
-The `rainbow tables/` directory is the authoritative source for the separate hash-table datasets. Its README lists A51 (1.5 TB), LANMAN (0.4 TB), MD5 (3.5 TB), MySQL SHA-1 (1.3 TB), NTLM (3.6 TB), NTLM 9 (6.7 TB), and NetNTLMv1 (4.3 TB compressed from 8 TB). It is excluded from the default archive crawl and torrent inventory because it is a separate multi-terabyte drive workload. Opt in explicitly:
+#### Seeing the layout
 
 ```bash
-python infocon_scraper.py --dest "/path/to/drive" \
-  --only-top "rainbow tables"
-
-python fetch_defcon_torrents.py --dest "/path/to/drive" \
-  --include-rainbow-tables
+python infocon_scraper.py --ddv-list      # no --dest needed; it is a catalog query
 ```
 
-The Rainbow Tables schema should be kept as separate DDV source-drive content: LANMAN/MSSQL/NTLM on Drive B, A5/1/GSM/MD5 on Drive C, NTLM-9 on Drive E, and the 4.2 Net-NTLMv1 table on Drive F. Do not place these datasets under Drive A's InfoCon archive tree.
+That prints every drive, the datasets it carries, the publisher's stated size,
+the size actually declared by the publisher's torrents, and whether the total
+still fits the drive it is nominally sold for:
+
+| Drive | Nominal | Contents | Measured | Fits? |
+| --- | ---: | --- | ---: | --- |
+| A | 6 TB | InfoCon.org archive | 6.29 TB | **No — over by 378 GB** |
+| B | 6 TB | LANMAN + MySQL SHA-1 + NTLM tables | 5.84 TB | Yes (98.8%) |
+| C | 6 TB | A5/1 (GSM) + MD5 tables | 5.57 TB | Yes (94.2%) |
+| D | 8 TB | vx-underground (2025 June) | 8.47 TB | **No — over by 595 GB** |
+| E | 8 TB | NTLM-9 tables | 6.71 TB | Yes (85.2%) |
+| F | 6 TB | Net-NTLMv1 table | 4.75 TB | Yes (80.3%) |
+
+Full DDV set: **37.63 TB across 1,048,611 files.**
+
+Sizes are measured from the publisher's own v1/v2 torrents, and capacity
+allows 1.5% for filesystem metadata (a drive sold as "6 TB" is 6 × 10¹² bytes,
+and a fresh ext4 with `-m 0` gives back a little less than that).
+
+**Two drives no longer fit their nominal capacity.** The archive grew; the drive
+sizes did not. This is reported rather than silently trimmed — deciding what to
+drop, or reaching for a larger disk, is your call, not the tool's. Drive D ships
+an `alternate` for exactly this reason: the 2024 June vx-underground snapshot is
+6.38 TB and still fits an 8 TB disk.
+
+#### Rebuilding a drive
+
+```bash
+# Drive B: LANMAN + MySQL SHA-1 + NTLM, torrent-first (the publisher asks for this)
+python fetch_defcon_torrents.py --dest "/mnt/driveB" --ddv B
+
+# Drive A: the InfoCon archive, HTTP with torrents filling the big trees
+python infocon_scraper.py --dest "/mnt/driveA" --ddv A --with-torrents
+```
+
+Before a single byte moves, the selection is printed and pre-flighted against
+the free space actually available at `--dest`:
+
+```
+DDV selection: 1 dataset(s), 6.71 TB, 10,008 files
+  drive E  ntlm9                  6.71 TB  NTLM 9 rainbow tables
+  INSUFFICIENT SPACE: 6.71 TB required but only 1.68 TB free at /mnt/x - short by 5.04 TB
+Refusing to start: ...
+Attach a larger drive, drop a dataset, or pass --ddv-no-preflight.
+```
+
+#### Mixing and matching
+
+Drives are the convenient unit, but datasets are the real one. Any combination
+works, across drive boundaries:
+
+```bash
+python infocon_scraper.py --dest "/mnt/mine" --ddv-dataset md5,ntlm,wordlists
+```
+
+| Dataset | Drive | Measured | Notes |
+| --- | --- | ---: | --- |
+| `cons` | A | 3.83 TB | 239 conferences |
+| `defcon` | A | 1.77 TB | The DEF CON archive |
+| `skills` | A | 312 GB | |
+| `wordlists` | A | 225 GB | 25 very large archives |
+| `podcasts` | A | 101 GB | |
+| `documentaries` | A | 54 GB | |
+| `ntlm` | B | 3.96 TB | |
+| `mysqlsha1` | B | 1.48 TB | See naming note below |
+| `lanman` | B | 398 GB | |
+| `md5` | C | 3.89 TB | |
+| `a51` | C | 1.68 TB | A5/1 is the GSM cipher |
+| `vx-underground` | D | 8.47 TB | 2025 June snapshot |
+| `vx-underground-2024` | D | 6.38 TB | Alternate that fits 8 TB |
+| `ntlm9` | E | 6.71 TB | 9-character, ~50% effective |
+| `net-ntlmv1` | F | 4.75 TB | Compressed from ~8 TB |
+
+Naming a drive and one of its own datasets does not double-count it, and
+`--ddv`/`--ddv-dataset` refuse to run alongside `--only-top`, `--only-cons`,
+`--only-mirrors` or `--only`: a profile *is* the selection, and letting it merge
+with a hand-rolled filter would produce a drive matching neither.
+
+#### Two details worth knowing
+
+**The hash tables live inside `rainbow tables/`, not beside it.** `--only-top`
+can only name a whole top-level section, so selecting Drive B that way would
+crawl all 22.87 TB of tables instead of its 5.84 TB. Each dataset therefore
+carries its exact sub-tree (`rainbow tables/ntlm`), and `NTLM` never selects
+`NTLM 9` — matching is done on the publisher's torrent names, which are exact.
+
+**DEF CON is unlinked from its own parent index.** `infocon.org/cons/` lists 239
+conference directories and does *not* include DEF CON, even though
+`cons/DEF CON/` is directly browsable and holds DEF CON 1 through 34. A plain
+`cons/` crawl therefore never descends into it. The `defcon` dataset keeps its
+own root for this reason; drop it and Drive A silently loses 1.77 TB.
+
+#### Keep the datasets on separate trees
+
+Drives B, C, E and F are hash tables and are excluded from the default crawl and
+torrent inventory because they are a separate multi-terabyte workload. Keep them
+in their own destination roots rather than combining them with the InfoCon
+mirror — do not place them under Drive A's tree. Drive D's vx-underground
+material likewise belongs on its own disk.
+
+If you would rather drive the tools by hand, the underlying flags still work:
+
+```bash
+python infocon_scraper.py --dest "/path/to/drive" --only-top "rainbow tables"
+python fetch_defcon_torrents.py --dest "/path/to/drive" --include-rainbow-tables
+python infocon_scraper.py --dest "/path/to/drive" --sources mirrors --only-mirrors "vx underground"
+```
+
+#### A naming discrepancy, surfaced rather than resolved
+
+The DDV drive list names Drive B's middle dataset **MSSQL**. The archive
+publishes **`mysqlsha1` / "MySQL SHA-1 rainbow tables"**, and no MSSQL set
+exists anywhere in `rainbow tables/`. The profile treats them as the same slot
+and says so in `--ddv-list` rather than quietly picking one and hoping.
+
+The publisher's own figures (from `rainbow tables/## READ ME RAINBOW TABLES ##.txt`,
+updated 2026-06-07) are A51 1.5 TB, LANMAN 0.4 TB, MD5 3.5 TB, MySQL SHA-1
+1.3 TB, NTLM 3.6 TB, NTLM 9 6.7 TB, NetNTLMv1 4.3 TB (compressed from 8 TB with
+a 3% RAR recovery record). Measured torrent sizes run consistently a little
+higher; both are shown so a divergence stays visible instead of being averaged
+away.
 
 To target the DDV-related mirror collection without crawling every conference:
 
