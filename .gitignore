@@ -10,6 +10,7 @@ __pycache__/
 .ruff_cache/
 .torrents-cache/
 run.out
+run.out.*
 torrent.out
 infocon-monitor.out
 infocon-monitor.out.tmp.*
