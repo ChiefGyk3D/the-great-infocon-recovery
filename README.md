@@ -52,7 +52,7 @@ Sizes and availability can change. Check the live listing before starting a larg
 Every year the DEF CON Data Duplication Village hands out a set of source drives
 that attendees queue up to copy. All of that content is published on
 infocon.org, so anyone can rebuild any of those drives from home. The hard part
-was never access — it was knowing *which* slice of a 37 TB archive belongs on
+was never access — it was knowing *which* slice of a 38 TB archive belongs on
 which drive, and whether what you picked will actually fit.
 
 `ddv_profiles.py` is that map, and both tools can be driven from it directly.
@@ -64,29 +64,42 @@ python infocon_scraper.py --ddv-list      # no --dest needed; it is a catalog qu
 ```
 
 That prints every drive, the datasets it carries, the publisher's stated size,
-the size actually declared by the publisher's torrents, and whether the total
-still fits the drive it is nominally sold for:
+the size actually measured, and whether the total still fits the drive it is
+nominally sold for:
 
 | Drive | Nominal | Contents | Measured | Fits? |
 | --- | ---: | --- | ---: | --- |
-| A | 6 TB | InfoCon.org archive | 6.29 TB | **No — over by 378 GB** |
+| A | 6 TB | InfoCon.org archive | 7.22 TB | **No — over by 1.31 TB** |
 | B | 6 TB | LANMAN + MySQL SHA-1 + NTLM tables | 5.84 TB | Yes (98.8%) |
 | C | 6 TB | A5/1 (GSM) + MD5 tables | 5.57 TB | Yes (94.2%) |
 | D | 8 TB | vx-underground (2025 June) | 8.47 TB | **No — over by 595 GB** |
 | E | 8 TB | NTLM-9 tables | 6.71 TB | Yes (85.2%) |
 | F | 6 TB | Net-NTLMv1 table | 4.75 TB | Yes (80.3%) |
 
-Full DDV set: **37.63 TB across 1,048,611 files.**
+Full DDV set: **38.56 TB across 1,051,439 files.**
 
-Sizes are measured from the publisher's own v1/v2 torrents, and capacity
-allows 1.5% for filesystem metadata (a drive sold as "6 TB" is 6 × 10¹² bytes,
-and a fresh ext4 with `-m 0` gives back a little less than that).
+Drive A is measured by walking the live infocon.org listing; the other five are
+measured from the publisher's own v1/v2 torrents. Capacity allows 1.5% for
+filesystem metadata (a drive sold as "6 TB" is 6 × 10¹² bytes, and a fresh ext4
+with `-m 0` gives back a little less than that).
 
 **Two drives no longer fit their nominal capacity.** The archive grew; the drive
 sizes did not. This is reported rather than silently trimmed — deciding what to
 drop, or reaching for a larger disk, is your call, not the tool's. Drive D ships
 an `alternate` for exactly this reason: the 2024 June vx-underground snapshot is
 6.38 TB and still fits an 8 TB disk.
+
+**Drive A — the InfoCon archive, and the drive this project exists to rebuild —
+needs more than 6 TB.** The village still hands it out on a 6 TB disk, and the
+live tree is now well past that, so the DDV copy must be compressed or trimmed
+in some way that infocon.org does not publish. Which files are dropped, whether
+anything is packed, or whether the village simply carries an older snapshot,
+cannot be worked out from the archive alone — it needs a full set of the village
+drives sitting next to a fresh build to compare against, and until someone has
+that, the difference stays a suspicion rather than a rule the tool can apply.
+The practical advice is simple: build Drive A on an 8 TB disk. The measured
+figure is also not the ceiling — the listing's sizes are rounded, media.defcon.org
+holds material beyond the archive, and the archive keeps growing.
 
 #### Rebuilding a drive
 
@@ -120,12 +133,12 @@ python infocon_scraper.py --dest "/mnt/mine" --ddv-dataset md5,ntlm,wordlists
 
 | Dataset | Drive | Measured | Notes |
 | --- | --- | ---: | --- |
-| `cons` | A | 3.83 TB | 239 conferences |
-| `defcon` | A | 1.77 TB | The DEF CON archive |
-| `skills` | A | 312 GB | |
-| `wordlists` | A | 225 GB | 25 very large archives |
-| `podcasts` | A | 101 GB | |
-| `documentaries` | A | 54 GB | |
+| `cons` | A | 3.76 TB | 239 conferences |
+| `defcon` | A | 2.69 TB | The DEF CON archive; its v2 torrent declares only 1.77 TB |
+| `skills` | A | 377 GB | |
+| `wordlists` | A | 225 GB | 27 very large archives |
+| `podcasts` | A | 156 GB | |
+| `documentaries` | A | 17 GB | |
 | `ntlm` | B | 3.96 TB | |
 | `mysqlsha1` | B | 1.48 TB | See naming note below |
 | `lanman` | B | 398 GB | |
@@ -153,7 +166,7 @@ carries its exact sub-tree (`rainbow tables/ntlm`), and `NTLM` never selects
 conference directories and does *not* include DEF CON, even though
 `cons/DEF CON/` is directly browsable and holds DEF CON 1 through 34. A plain
 `cons/` crawl therefore never descends into it. The `defcon` dataset keeps its
-own root for this reason; drop it and Drive A silently loses 1.77 TB.
+own root for this reason; drop it and Drive A silently loses 2.69 TB.
 
 #### Preparing the drive itself
 
@@ -216,13 +229,13 @@ workload:
 sudo mkfs.ext4 -m 0 -N 1600000 -L infocon /dev/sdb1
 ```
 
-- **`-m 0`** drops the 5% reserve ext4 withholds for root. On a 6 TB drive that
-  is roughly 300 GB — on a dataset that already overflows its nominal capacity.
+- **`-m 0`** drops the 5% reserve ext4 withholds for root. On an 8 TB drive that
+  is roughly 400 GB — more than half the headroom Drive A leaves on one.
 - **`-N 1600000`** sets the inode count from the drive's real file count rather
-  than the default one-inode-per-16 KiB. Drive A holds 529,489 files averaging
-  12 MB; the default would provision ~366 million inodes and spend about
-  **98 GB** on tables that stay empty. The number is computed per selection, so
-  Drive F (4,098 files averaging 1.2 GB) gets a far smaller one.
+  than the default one-inode-per-16 KiB. Drive A holds 532,317 files averaging
+  14 MB; at the default ratio its 7.22 TB would provision ~440 million inodes
+  and spend about **112 GB** on tables that stay empty. The number is computed
+  per selection, so Drive F (4,098 files averaging 1.2 GB) gets a far smaller one.
 
 The NTFS mount line includes `windows_names`, which refuses filenames Windows
 could not represent. Without it the drive only *looks* portable.
