@@ -4,6 +4,18 @@ The Great InfoCon Recovery rebuilds and maintains a local time capsule of the [I
 
 This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE).
 
+## Contents
+
+- [What It Does](#what-it-does) - scope, mirrors, and the DDV source-drive relationship
+- [Requirements](#requirements) - environment, tests, and linting
+- [HTTP Sync](#http-sync) - crawling, ordering, concurrency budgets, and scheduling
+- [DEF CON Torrents](#def-con-torrents) - the BitTorrent path, [sharing back](#sharing-back), and [verification](#verifying-against-publisher-piece-hashes)
+- [Combined Torrent and HTTP Mode](#combined-torrent-and-http-mode) - how the two engines divide the work
+- [Monitoring](#monitoring) - logs, the overview daemon, and the tmux dashboard
+- [Robustness](#robustness) - every integrity guarantee, and its limits
+- [How the Two Engines Cooperate](#how-the-two-engines-cooperate) - ownership, fallback, and why it matters
+- [Safety Notes](#safety-notes)
+
 ## What It Does
 
 `infocon_scraper.py` mirrors:
@@ -325,6 +337,49 @@ Combined mode exposes the same controls as `--torrent-seed-time`, `--torrent-see
 
 Fast-resume data is checkpointed every `--resume-save-minutes` (default 5) and again on exit, including after `Ctrl+C`. Without it every restart re-hash-checks the entire set - terabytes on a populated drive - before anything can transfer. Checkpoints live under the torrent cache directory, so relocating the cache with `--torrents-dir` or `INFOCON_TORRENTS_CACHE` moves them too.
 
+### Verifying Against Publisher Piece Hashes
+
+There are two different questions about a file, and only one of them the HTTP sync can answer.
+
+The manifest's SHA-256 proves a file **has not changed since it was first seen**. It cannot prove the file **matches what was published**, because neither archive host sends `Content-Length` and the directory listing's size is rounded. At gigabyte scale that rounding allows about 107 MB of tolerance, so a materially short file passes every check available over HTTP - and once its hash is recorded from the short copy, `--verify-all` will keep confirming it forever.
+
+The torrents carry the publisher's own piece hashes, which settles the question:
+
+```bash
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" --verify-only
+```
+
+This **transfers nothing and changes nothing**. Each archive is added in `upload_mode` with peer discovery disabled, rechecked against its piece hashes, then removed from the session without touching the files. Scope it with the usual filters, and write a machine-readable result with `--verify-report`:
+
+```bash
+# Verify a few archives and save the result
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --verify-only --only "DEF CON 30,DEF CON 31" --verify-report ~/verify.json
+
+# Verify everything, including the opt-in trees
+python fetch_defcon_torrents.py --dest "/path/to/drive/cons/DEF CON" \
+  --verify-only --include-mirrors --include-rainbow-tables
+```
+
+Output reports each archive, and cross-references the HTTP manifest to flag the case that matters most - a file the manifest records as verified that the piece hashes say is incomplete:
+
+```
+Verifying 2600 archive (73.55 GB, 6982 files) ...
+  100.00% verified by piece hash - OK
+Verifying BlueHat archive (11.20 GB, 812 files) ...
+   94.31% verified by piece hash - 3 file(s) incomplete, 1 WRONGLY CATALOGUED AS GOOD
+
+=== verification summary ===
+  archives checked : 2
+  verified         : 0.084 TB of 0.085 TB (98.82%)
+  incomplete files : 3
+  of those, recorded in the manifest as verified: 1
+```
+
+The command exits non-zero when anything is wrongly catalogued, so it can gate a script. Verification reads every byte it checks, so scope it rather than running the whole archive casually, and note that it takes the same drive-level lock as a sync - stop the sync first, or pass `--force` if you accept both processes competing for the disk.
+
+Coverage is broad: the online inventory holds **330 torrents** spanning `cons/` (284), `podcasts/` (33), `skills/` (11), `documentaries/` and `word lists/`. Content without a torrent - notably a DEF CON year published before its torrent exists - can only be checked by size and recorded hash.
+
 ### Combined Torrent and HTTP Mode
 
 To use the torrent-backed DEF CON content as the authoritative source while filling the rest of the archive over HTTP, run:
@@ -435,6 +490,7 @@ The HTTP sync is built to survive interruptions and large runs:
 - **Signal handling.** `SIGINT`/`SIGTERM` finish in-flight downloads, save the manifest, checkpoint torrent fast-resume data, and release the lock. The torrent phase runs on its own thread and is stopped through the same signal, rather than being left running while shutdown waits on it.
 - **Honest progress.** The reported rate and totals include bytes staged by transfers still in flight, so a run pulling several multi-gigabyte archives shows real throughput instead of `0 B/s` until the first one lands.
 - **Corruption detection.** A local file whose recorded hash no longer matches is re-downloaded.
+- **Authenticity, where it is available.** `--verify-only` checks local data against the publisher's piece hashes, which is the only check that proves a file matches what was published rather than merely being unchanged since it was first seen. See [Verifying Against Publisher Piece Hashes](#verifying-against-publisher-piece-hashes).
 - **Untrusted listing names.** A directory entry whose name is not a single path segment - absolute, or containing a separator or `..` - is ignored instead of being joined onto the destination path.
 
 Relevant options:
@@ -443,6 +499,33 @@ Relevant options:
 python infocon_scraper.py --dest "/path/to/drive" \
   --retries 6 --stall-timeout 600 --min-free-gib 5
 ```
+
+### Known Limits
+
+These are stated plainly because knowing where a guarantee stops is part of the guarantee.
+
+- **Size verification is only as precise as the listing.** Neither host sends `Content-Length`, so completeness is judged against the listing's rounded size within the slack its precision implies. A value printed as `648.6 KiB` is known to about 102 bytes; one printed as `4.5 GiB` is known only to about 107 MB. A file short by less than that slack, with no prior manifest entry, would be accepted. `--verify-only` is the answer where a torrent exists.
+- **A recorded hash proves continuity, not authenticity.** If a file was already damaged the first time it was catalogued, its hash was taken from the damaged copy, and `--verify-all` will keep confirming it. Only piece-hash verification can tell the difference.
+- **Interrupted transfers restart.** Neither host honours `Range`, so a partial HTTP download cannot be resumed and begins again. This is detected once per host at runtime rather than assumed.
+- **Upstream renames are additive.** When a conference is renamed or reorganised upstream, the sync fetches it under the new path and leaves the old copy in place. Nothing is deleted automatically, so a long-lived drive accumulates superseded directories that must be reviewed by hand.
+- **Content without a torrent cannot be piece-verified.** Most of the archive is covered, but a DEF CON year published before its torrent exists is checkable only by size and recorded hash.
+- **Case-variant paths cannot be reproduced everywhere.** NTFS as written from Linux stores names case-sensitively; Windows, exFAT and macOS do not. The published archive contains no case collisions, so this only bites a drive that has accumulated superseded directories from earlier syncs.
+
+## How the Two Engines Cooperate
+
+The HTTP crawler and the BitTorrent engine can both reach the same destination paths, so the rules between them are worth stating plainly.
+
+**Torrents own their content while they run.** When a torrent is added, it claims the directory it writes into, and the HTTP sync skips everything underneath. This is not merely an optimisation. libtorrent stores files sparsely, so an in-progress file already reports its *final* size on disk while containing holes - and because the hosts publish no `Content-Length`, HTTP judges completeness by size. Without the claim, HTTP would accept a half-written file as whole, hash it, and record it as verified permanently. Standing off also stops the two engines transferring the same bytes at once.
+
+**Ownership is released on completion or hand-off.** A torrent that finishes releases its directory, its data already verified piece by piece, so HTTP may then inspect it. A torrent that stalls also releases it, so the HTTP fallback can take over.
+
+**A stalled torrent is paused, never discarded.** Its files stay exactly where they are. The fallback then crawls that archive's own folder and fills gaps: complete files are kept and catalogued, missing files are fetched, wrong-sized files are re-fetched in full. Nothing is trashed and nothing complete is downloaded twice.
+
+**Only actively scheduled torrents can stall.** An archive queued behind `--torrent-max-active` reports zero peers because it has not been started, not because it is dead. Timing those would hand the entire queue to HTTP within `--torrent-stalled-minutes` of checking finishing.
+
+**A fallback crawls the archive's own folder and nothing wider.** `cons/2600 archive v1 - infocon.org.torrent` falls back to `cons/2600/`, never to all of `cons/`. Fallbacks are deduplicated by root, skipped when the ordinary sync already covers the path, and run one at a time on a shared queue.
+
+**A sparse file is treated as incomplete whatever its size says.** Independently of ownership, a local file that claims the right size but is barely allocated is discarded and re-fetched. That catches abandoned torrents from earlier runs, which no live registry could know about.
 
 ## Safety Notes
 

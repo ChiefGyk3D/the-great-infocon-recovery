@@ -30,6 +30,7 @@ import heapq
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -682,6 +683,173 @@ def _merge_infocon_candidates(
     return available
 
 
+def _torrent_file_for(spec: TorrentSpec, torrents_dir: str, settings: TorrentSettings) -> str | None:
+    """Cached .torrent path for a spec, fetching the metadata if needed."""
+    cache_name = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{spec.save_path}_{spec.name}")
+    path = os.path.join(torrents_dir, f"{cache_name}.torrent")
+    if not os.path.exists(path):
+        try:
+            curl_download(spec.url, path, settings)
+        except RuntimeError as exc:
+            print(f"Skipping {spec.name}: could not fetch torrent ({exc})")
+            return None
+    return path
+
+
+def verify_archives(specs: list[TorrentSpec], torrents_dir: str, settings: TorrentSettings,
+                    manifest_path: str | None = None, report_path: str | None = None,
+                    stop_event: threading.Event | None = None) -> dict:
+    """Check local files against the publisher's piece hashes. Never transfers.
+
+    A SHA-256 recorded by the HTTP sync only proves a file has not changed since
+    it was first seen. It cannot prove the file matches what was published,
+    because neither archive host sends Content-Length and the directory
+    listing's size is rounded - at gigabyte scale that tolerance is ~107 MB, so
+    a materially short file can pass. The torrents carry the publisher's own
+    piece hashes, which settles it.
+
+    Torrents are added paused and in upload_mode so nothing is ever fetched,
+    and removed afterwards without touching the files on disk.
+    """
+    session = build_libtorrent_session(settings)
+    manifest = None
+    if manifest_path and os.path.exists(manifest_path):
+        manifest = sqlite3.connect(manifest_path, check_same_thread=False)
+
+    results = []
+    totals = {"archives": 0, "verified_bytes": 0, "total_bytes": 0,
+              "incomplete_files": 0, "falsely_catalogued": 0}
+
+    for spec in specs:
+        if stop_event is not None and stop_event.is_set():
+            print("Stop requested; ending verification early.")
+            break
+        torrent_path = _torrent_file_for(spec, torrents_dir, settings)
+        if not torrent_path:
+            continue
+        try:
+            info = lt.torrent_info(torrent_path)
+        except RuntimeError as exc:
+            print(f"Skipping {spec.name}: could not load torrent ({exc})")
+            continue
+
+        atp = lt.add_torrent_params()
+        atp.ti = info
+        atp.save_path = spec.save_path
+        # upload_mode stops it requesting any piece, and peer discovery is
+        # switched off, so nothing is transferred. It must NOT be added paused:
+        # force_recheck() on a paused torrent never starts, and the check would
+        # silently report zero verified bytes.
+        atp.flags = (lt.torrent_flags.upload_mode
+                     | lt.torrent_flags.disable_dht
+                     | lt.torrent_flags.disable_lsd
+                     | lt.torrent_flags.disable_pex)
+        handle = session.add_torrent(atp)
+        handle.unset_flags(lt.torrent_flags.auto_managed)
+        handle.force_recheck()
+
+        checking = (lt.torrent_status.checking_files,
+                    lt.torrent_status.checking_resume_data,
+                    lt.torrent_status.queued_for_checking)
+        print(f"Verifying {spec.name} ({info.total_size() / 1e9:.2f} GB, {info.num_files()} files) ...")
+        # Wait for the recheck to actually start before waiting for it to end,
+        # otherwise the very first status read exits the loop immediately.
+        start_deadline = time.time() + 15
+        while time.time() < start_deadline and handle.status().state not in checking:
+            time.sleep(0.2)
+        last_note = time.time()
+        while handle.status().state in checking:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if time.time() - last_note >= 30:
+                last_note = time.time()
+                print(f"    ... {handle.status().progress * 100:.1f}% checked")
+            time.sleep(1)
+
+        # Let the check settle. total_done keeps climbing for a moment after the
+        # state leaves checking, so reading it immediately reports a complete
+        # archive as partially verified.
+        settle = time.time() + 10
+        previous = -1
+        while time.time() < settle:
+            current = handle.status().total_done
+            if current == previous:
+                break
+            previous = current
+            time.sleep(0.3)
+
+        total = info.total_size()
+        missing = []
+        try:
+            progress = list(handle.file_progress())
+        except RuntimeError:
+            progress = []
+        files = info.files()
+        # Derive the verified total from the same per-file numbers used to list
+        # incomplete files, so the summary and the detail can never disagree.
+        verified = sum(progress) if progress else handle.status().total_done
+        for index, done in enumerate(progress):
+            want = files.file_size(index)
+            if done < want:
+                missing.append({"file": files.file_path(index), "have": done, "want": want})
+
+        catalogued = 0
+        if manifest is not None:
+            # Manifest keys are relative to the drive root, which is the
+            # directory holding the manifest database.
+            root = os.path.dirname(os.path.abspath(manifest_path))
+            for entry in missing:
+                abs_path = os.path.join(spec.save_path, entry["file"])
+                rel = os.path.relpath(abs_path, root) if root else abs_path
+                row = manifest.execute(
+                    "SELECT sha256 FROM entries WHERE rel = ?", (rel,)).fetchone()
+                if row and row[0]:
+                    catalogued += 1
+                    entry["catalogued_as_good"] = True
+
+        results.append({
+            "name": spec.name,
+            "save_path": spec.save_path,
+            "total_bytes": total,
+            "verified_bytes": verified,
+            "complete": verified >= total,
+            "incomplete_files": missing,
+            "falsely_catalogued": catalogued,
+        })
+        totals["archives"] += 1
+        totals["verified_bytes"] += verified
+        totals["total_bytes"] += total
+        totals["incomplete_files"] += len(missing)
+        totals["falsely_catalogued"] += catalogued
+
+        pct = 100.0 * verified / total if total else 100.0
+        flag = "OK" if verified >= total else f"{len(missing)} file(s) incomplete"
+        extra = f", {catalogued} WRONGLY CATALOGUED AS GOOD" if catalogued else ""
+        print(f"  {pct:6.2f}% verified by piece hash - {flag}{extra}")
+
+        session.remove_torrent(handle)  # never with delete_files
+
+    if manifest is not None:
+        manifest.close()
+
+    print("\n=== verification summary ===")
+    print(f"  archives checked : {totals['archives']}")
+    if totals["total_bytes"]:
+        print(f"  verified         : {totals['verified_bytes'] / 1e12:.3f} TB of "
+              f"{totals['total_bytes'] / 1e12:.3f} TB "
+              f"({100.0 * totals['verified_bytes'] / totals['total_bytes']:.2f}%)")
+    print(f"  incomplete files : {totals['incomplete_files']}")
+    print(f"  of those, recorded in the manifest as verified: {totals['falsely_catalogued']}")
+
+    report = {"totals": totals, "archives": results}
+    if report_path:
+        os.makedirs(os.path.dirname(report_path) or ".", exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as stream:
+            json.dump(report, stream, indent=2, sort_keys=True)
+        print(f"  report written to {report_path}")
+    return report
+
+
 def fetch_all(dest: str, torrents_dir: str, only: list[str] | None,
               settings: TorrentSettings, ready_event: threading.Event | None = None,
               skip: list[str] | None = None,
@@ -1009,6 +1177,13 @@ def main() -> int:
     parser.add_argument("--dest", required=True, help="Destination cons/DEF CON directory")
     parser.add_argument("--force", action="store_true",
                          help="Override the shared drive-level lock and run anyway")
+    parser.add_argument("--verify-only", action="store_true",
+                        help="Check local files against the publisher's piece hashes and exit. "
+                             "Transfers nothing and changes nothing on disk. This is the only "
+                             "check that proves a file matches what was published - a recorded "
+                             "SHA-256 only proves it has not changed since it was first seen.")
+    parser.add_argument("--verify-report", default=None,
+                        help="Write the verification result to this path as JSON")
     parser.add_argument("--only", default=None,
                          help="Comma-separated substrings to restrict which items are fetched "
                               "(default: all available torrents)")
@@ -1107,6 +1282,33 @@ def main() -> int:
         seed_rate_limit_kib=max(0, args.seed_rate_limit),
         max_seeding=max(1, args.max_seeding),
     )
+    if args.verify_only:
+        specs = discover_torrents_indexed(
+            [(TORRENTS_DIR_URL, args.dest), (INFOCON_ROOT_URL, os.path.dirname(os.path.dirname(args.dest)))],
+            settings, args.torrent_index, args.torrent_index_ttl_hours,
+            include_mirrors=args.include_mirrors,
+            include_rainbow_tables=args.include_rainbow_tables,
+            checkpoint_path=args.torrent_discovery_checkpoint,
+        )
+        if only:
+            filters = [f.lower() for f in only]
+            specs = [s for s in specs if any(f in s.name.lower() for f in filters)]
+        if defcon_only:
+            filters = [f.lower() for f in defcon_only]
+            specs = [s for s in specs
+                     if not re.search(r"\bdef con\b", s.name, re.IGNORECASE)
+                     or any(f in s.name.lower() for f in filters)]
+        if skip:
+            filters = [f.lower() for f in skip]
+            specs = [s for s in specs if not any(f in s.name.lower() for f in filters)]
+        drive_root = os.path.dirname(os.path.dirname(os.path.abspath(args.dest)))
+        report = verify_archives(
+            specs, args.torrents_dir, settings,
+            manifest_path=os.path.join(drive_root, ".infocon_manifest.db"),
+            report_path=args.verify_report,
+        )
+        return 1 if report["totals"]["falsely_catalogued"] else 0
+
     return fetch_all(args.dest, args.torrents_dir, only, settings, skip=skip,
                      include_mirrors=args.include_mirrors,
                      include_rainbow_tables=args.include_rainbow_tables,
