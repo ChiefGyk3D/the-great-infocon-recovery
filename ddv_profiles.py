@@ -4,7 +4,7 @@ DEF CON Data Duplication Village (DDV) source-drive profiles.
 Every year the DDV hands out a set of source drives that people queue up to
 copy. All of the content is published on infocon.org, so anyone can rebuild any
 of those drives from home - the hard part was never access, it was knowing
-*which* parts of a 30 TB archive belong on which drive, and whether what you
+*which* parts of a 38 TB archive belong on which drive, and whether what you
 picked will actually fit.
 
 This module is that map. It records, for each DDV drive:
@@ -20,10 +20,19 @@ Sizes drift as the archive grows. Two of the six drives no longer fit their
 nominal capacity, and this module reports that rather than quietly trimming:
 picking a smaller drive is the operator's decision, not ours.
 
-`measured_bytes` is a snapshot taken from the v1/v2 torrents on CATALOG_DATE.
-It exists so `--ddv-list` and the pre-flight capacity check can answer before
-a multi-hour crawl. The live crawl remains the authority for what is actually
-transferred.
+Drive A - the InfoCon archive itself, and what this project rebuilds by
+default - is the one that matters. The village still hands it out on a 6 TB
+disk, and the live tree no longer fits one. The village copy must therefore be
+compressed or trimmed in some way that infocon.org does not publish, and that
+cannot be worked out without a full set of the village drives to compare a
+fresh build against. Until then a rebuild needs a bigger disk than the DDV
+uses, and this catalog says so rather than pretending otherwise.
+
+`measured_bytes` is a snapshot taken on CATALOG_DATE: Drive A from walking the
+live infocon.org listing (the torrents are older snapshots and understate it),
+everything else from the publisher's v1/v2 torrents. It exists so `--ddv-list`
+and the pre-flight capacity check can answer before a multi-hour crawl. The
+live crawl remains the authority for what is actually transferred.
 """
 from __future__ import annotations
 
@@ -32,9 +41,9 @@ from dataclasses import dataclass, field
 
 TB = 10 ** 12
 
-#: Date the measured_bytes/measured_files snapshot was taken from the
-#: publisher's torrents. Shown in --ddv-list so stale figures are obvious.
-CATALOG_DATE = "2026-08-24"
+#: Date the measured_bytes/measured_files snapshot was taken. Shown in
+#: --ddv-list so stale figures are obvious.
+CATALOG_DATE = "2026-09-02"
 
 #: Filesystem metadata overhead. A drive sold as "6 TB" is 6e12 bytes, and a
 #: fresh ext4 with -m 0 gives back roughly this much less. Used only to warn
@@ -116,7 +125,11 @@ class Drive:
 # README.md. Dataset sizes come from the publisher: the stated figures from
 # infocon.org's own "## READ ME RAINBOW TABLES ##.txt" (updated 2026-06-07),
 # and the measured figures from summing the non-pad files declared by each
-# dataset's v1/v2 torrents.
+# dataset's v1/v2 torrents - except Drive A, which is measured by walking the
+# live infocon.org listing. Its torrents are dated snapshots and the live tree
+# has moved well past them (the DEF CON archive torrent declares 1.77 TB; the
+# browsable cons/DEF CON tree is 2.69 TB), so the torrent figure would send
+# people out to buy a drive that cannot hold the result.
 # ---------------------------------------------------------------------------
 
 _ARCHIVE_SOURCES = ("infocon",)
@@ -127,8 +140,8 @@ DATASETS: tuple[Dataset, ...] = (
         key="cons",
         label="Conference archives (excl. DEF CON)",
         drive="A",
-        measured_bytes=3_830_000_000_000,
-        measured_files=373_748,
+        measured_bytes=3_759_000_000_000,
+        measured_files=367_820,
         selection=Selection(sources=_ARCHIVE_SOURCES, only_top=("cons",),
                             paths=("cons",)),
         note=(
@@ -141,24 +154,26 @@ DATASETS: tuple[Dataset, ...] = (
         key="defcon",
         label="DEF CON archive",
         drive="A",
-        measured_bytes=1_766_000_000_000,
-        measured_files=83_879,
+        measured_bytes=2_685_000_000_000,
+        measured_files=91_094,
         selection=Selection(sources=_ARCHIVE_SOURCES, only_top=("cons",),
                             paths=("cons/DEF CON",),
                             torrent_names=("DEF CON archive",)),
         note=(
             "Available both as a browsable tree under cons/DEF CON and as "
             "'DEF CON archive v1/v2'; the torrent is preferred because it carries web "
-            "seeds and verifies by piece hash. media.defcon.org hosts additional "
-            "material beyond this archive - that surplus is not part of Drive A."
+            "seeds and verifies by piece hash, but it is a dated snapshot (v2 "
+            "declares 1.77 TB) and the live tree is far larger; the HTTP sync fills "
+            "the rest. media.defcon.org hosts additional material beyond this "
+            "archive - that surplus is not part of Drive A."
         ),
     ),
     Dataset(
         key="skills",
         label="Skills / making",
         drive="A",
-        measured_bytes=312_000_000_000,
-        measured_files=55_638,
+        measured_bytes=377_000_000_000,
+        measured_files=55_407,
         selection=Selection(sources=_ARCHIVE_SOURCES, only_top=("skills",),
                             paths=("skills",)),
     ),
@@ -167,7 +182,7 @@ DATASETS: tuple[Dataset, ...] = (
         label="Word lists",
         drive="A",
         measured_bytes=225_000_000_000,
-        measured_files=25,
+        measured_files=27,
         selection=Selection(sources=_ARCHIVE_SOURCES, only_top=("word lists",),
                             paths=("word lists",)),
         note="A handful of very large archives rather than many files.",
@@ -176,8 +191,8 @@ DATASETS: tuple[Dataset, ...] = (
         key="podcasts",
         label="Podcasts",
         drive="A",
-        measured_bytes=101_000_000_000,
-        measured_files=13_014,
+        measured_bytes=156_000_000_000,
+        measured_files=16_950,
         selection=Selection(sources=_ARCHIVE_SOURCES, only_top=("podcasts",),
                             paths=("podcasts",)),
     ),
@@ -185,8 +200,8 @@ DATASETS: tuple[Dataset, ...] = (
         key="documentaries",
         label="Documentaries",
         drive="A",
-        measured_bytes=54_000_000_000,
-        measured_files=3_185,
+        measured_bytes=17_000_000_000,
+        measured_files=1_019,
         selection=Selection(sources=_ARCHIVE_SOURCES, only_top=("documentaries",),
                             paths=("documentaries",)),
     ),
@@ -324,7 +339,10 @@ DATASETS: tuple[Dataset, ...] = (
 DRIVES: tuple[Drive, ...] = (
     Drive("A", 6 * TB, "InfoCon.org archive",
           ("cons", "defcon", "skills", "wordlists", "podcasts", "documentaries"),
-          note="What this project rebuilds by default."),
+          note=("What this project rebuilds by default. Needs more than the 6 TB "
+                "the village hands it out on: the DDV copy is presumably compressed "
+                "or trimmed in a way that cannot be reproduced without a full set of "
+                "the village drives to compare against. Use an 8 TB disk.")),
     Drive("B", 6 * TB, "LANMAN, MySQL SHA-1 and NTLM hash tables",
           ("lanman", "mysqlsha1", "ntlm")),
     Drive("C", 6 * TB, "A5/1 (GSM) and MD5 hash tables",
@@ -538,7 +556,8 @@ def format_catalog(fs_overhead: float = DEFAULT_FS_OVERHEAD) -> str:
     """The --ddv-list output: every drive, its datasets, and whether it fits."""
     out: list[str] = []
     out.append("DEF CON Data Duplication Village - source-drive profiles")
-    out.append(f"Sizes measured from publisher torrents on {CATALOG_DATE}; "
+    out.append(f"Sizes measured on {CATALOG_DATE} - Drive A from the live infocon.org "
+               f"listing, the rest from publisher torrents; "
                f"capacity allows {fs_overhead * 100:.1f}% filesystem overhead.")
     out.append("")
 
@@ -561,7 +580,8 @@ def format_catalog(fs_overhead: float = DEFAULT_FS_OVERHEAD) -> str:
                 f"use a larger drive or drop a dataset"
             )
         if d.note:
-            out.append(f"         {d.note}")
+            for line in _wrap(d.note, 70):
+                out.append(f"         {line}")
         for ds in members:
             pub = ""
             if ds.published_bytes:
