@@ -31,6 +31,6 @@ while :; do
     fi
 
     printf '\nRecent HTTP failures:\n'
-    grep -Ei 'ERROR|curl: \(' "$LOG" 2>/dev/null | tail -n 6 || printf 'none\n'
+    grep -E ' (ERROR|WARNING) |curl: \(' "$LOG" 2>/dev/null | tail -n 6 || printf 'none\n'
     sleep "$INTERVAL"
 done
