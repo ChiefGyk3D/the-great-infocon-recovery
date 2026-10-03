@@ -9,7 +9,7 @@ Two things make this more than a documentation blob:
      output.
   2. The ext4 defaults are actively wrong for this workload. One inode per
      16 KiB on a 6 TB drive provisions ~366 million inodes for a dataset with
-     529,489 files, spending roughly 93 GB on tables that stay empty - on a
+     ~530,000 files, spending roughly 93 GB on tables that stay empty - on a
      drive that already overflows its nominal capacity.
 
 Nothing here formats anything: these functions return text for a human to run.
@@ -108,7 +108,7 @@ class TestInodeSizing(unittest.TestCase):
         self.assertEqual(inode_count(self.drive_a()) % 100_000, 0)
 
     def test_a_file_heavy_drive_needs_more_inodes_than_a_file_light_one(self):
-        heavy = inode_count(ddv_profiles.resolve(drives=["A"]))    # 529,489 files
+        heavy = inode_count(ddv_profiles.resolve(drives=["A"]))    # ~half a million files
         light = inode_count(ddv_profiles.resolve(drives=["F"]))    # 4,098 files
         self.assertGreater(heavy, light)
 
@@ -212,7 +212,8 @@ class TestFormatHelp(unittest.TestCase):
 
     def test_help_reports_the_selection_shape(self):
         text = format_help(drives=["A"])
-        self.assertIn("529,489 files", text)
+        files = ddv_profiles.total_files(ddv_profiles.resolve(drives=["A"]))
+        self.assertIn(f"{files:,} files", text)
         self.assertIn("average", text)
 
     def test_help_without_a_device_says_how_to_get_commands(self):

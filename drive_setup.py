@@ -8,8 +8,8 @@ move on". Three things make it awkward:
      have to be readable by whoever plugs them in at the village - Windows,
      macOS and Linux alike. A drive formatted for one OS is a worse copy of a
      DDV drive even if it holds identical bytes.
-  2. The datasets have wildly different shapes. Drive A is 529,489 files
-     averaging 12 MB; Drive F is 4,098 files averaging 1.2 GB. ext4's default
+  2. The datasets have wildly different shapes. Drive A is 532,317 files
+     averaging 14 MB; Drive F is 4,098 files averaging 1.2 GB. ext4's default
      inode ratio would waste ~93 GB on a 6 TB drive - more than the free space
      these drives have to spare.
   3. Word lists include single files over 9 GB, which rules out FAT32 outright
@@ -150,7 +150,7 @@ def inode_count(datasets: list[Dataset]) -> int:
 
     mkfs.ext4 defaults to one inode per 16 KiB, sized for a general-purpose
     root filesystem. These drives hold a comparatively small number of very
-    large files - Drive A averages 12 MB per file, Drive F averages 1.2 GB -
+    large files - Drive A averages 14 MB per file, Drive F averages 1.2 GB -
     so the default provisions two orders of magnitude more inodes than needed
     and charges real capacity for them.
 
