@@ -25,16 +25,18 @@ jobs:
       DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}   # optional Service Token fallback; unset means OIDC only
     with:
       python-versions: '["3.10", "3.11", "3.12", "3.13"]'
+      runners: '["ubuntu-24.04", "ubuntu-24.04-arm"]'
+      distros: '["debian:12", "debian:13", "ubuntu:24.04"]'
+      distro-runners: '["ubuntu-24.04", "ubuntu-24.04-arm"]'
       install-command: |
         python -m pip install --upgrade pip
         pip install -r requirements-dev.txt
         pip install --no-deps -e .
-      test-command: pytest
+      test-command: python -m pytest tests/ -v
       lint-install-command: |
         pip install ruff
       lint-command: |
         ruff check .
-        ruff format --check . || echo "::warning title=ruff format::formatting drift (advisory)"
       smoke-command: infocon-scraper --help
       docker-build: false
       egress-policy: block
