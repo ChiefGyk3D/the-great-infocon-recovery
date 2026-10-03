@@ -166,9 +166,9 @@ def main() -> int:
     if not yes_no("Start this refresh now?", not args.repeat):
         print("Cancelled.")
         return 0
-    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
     # argv is a list (no shell) led by the repo's own interpreter and script; the env/.env-derived values are validated
     # in build_command (numbers via int(), content order allow-listed, DEF CON list matched, paths/names refuse a leading '-').
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
     return subprocess.call(command, cwd=ROOT)
 
 
