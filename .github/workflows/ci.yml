@@ -1,0 +1,52 @@
+# CI for the-great-infocon-recovery. The jobs live in ChiefGyk3D/git-your-ship-together; this file
+# says only what is specific to this repository.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/python-ci.yml@0e58a0e61ea8b3800d1cb0e6ed81bb860ace2094 # v1.6.3
+    permissions:
+      contents: read
+      id-token: write   # Doppler OIDC (see the shared repository's README)
+    secrets:
+      DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}   # optional Service Token fallback; unset means OIDC only
+    with:
+      python-versions: '["3.10", "3.11", "3.12", "3.13"]'
+      install-command: |
+        python -m pip install --upgrade pip
+        pip install -r requirements-dev.txt
+        pip install --no-deps -e .
+      test-command: pytest
+      lint-install-command: |
+        pip install ruff
+      lint-command: |
+        ruff check .
+        ruff format --check . || echo "::warning title=ruff format::formatting drift (advisory)"
+      smoke-command: infocon-scraper --help
+      docker-build: false
+      egress-policy: block
+      doppler-project: ci
+      doppler-config: ci
+      doppler-identity-id: ${{ vars.DOPPLER_IDENTITY_ID }}
+
+  shell:
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/bash-ci.yml@0e58a0e61ea8b3800d1cb0e6ed81bb860ace2094 # v1.6.3
+    permissions:
+      contents: read
+    with:
+      shfmt-args: -i 4 -ci
+      workflow-lint: false   # the ci job above already lints the workflow files
+      egress-policy: block
