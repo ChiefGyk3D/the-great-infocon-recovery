@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 from pathlib import Path
@@ -61,6 +62,17 @@ def number(label: str, default: int, minimum: int = 1) -> int:
         print(f"Enter a whole number of at least {minimum}.")
 
 
+CONTENT_ORDERS = {"newest", "oldest"}
+DEFCON_LIST = re.compile(r"\d+(,\d+)*")
+
+
+def safe_value(label: str, value: str) -> str:
+    """Reject values that could be read as an option or break the argv (leading dash, control characters)."""
+    if value.startswith("-") or any(ord(ch) < 32 for ch in value):
+        raise SystemExit(f"Refusing {label} {value!r}: it must not start with '-' or contain control characters.")
+    return value
+
+
 def build_command(env: dict[str, str], interactive: bool) -> list[str]:
     destination = env.get("INFOCON_DEST", "/media/chiefgyk3d/infocon.org DC30")
     if interactive:
@@ -109,6 +121,13 @@ def build_command(env: dict[str, str], interactive: bool) -> list[str]:
     if interactive and "INFOCON_CONTENT_ORDER" not in env:
         content_order = "newest" if menu("Content order", ["Newest first (recommended)", "Oldest first"], 1) == 1 else "oldest"
 
+    destination = safe_value("destination", destination)
+    skip_recent = safe_value("skip-recent names", skip_recent)
+    if defcon_only and not DEFCON_LIST.fullmatch(defcon_only):
+        raise SystemExit(f"Refusing DEF CON numbers {defcon_only!r}: use comma-separated whole numbers, e.g. 30,31.")
+    if content_order not in CONTENT_ORDERS:
+        raise SystemExit(f"Refusing content order {content_order!r}: choose one of {sorted(CONTENT_ORDERS)}.")
+
     command = [PYTHON, str(ROOT / "infocon_scraper.py"), "--dest", destination, "--with-torrents"]
     if skip_recent:
         command += ["--skip-recent", skip_recent]
@@ -147,6 +166,9 @@ def main() -> int:
     if not yes_no("Start this refresh now?", not args.repeat):
         print("Cancelled.")
         return 0
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
+    # argv is a list (no shell) led by the repo's own interpreter and script; the env/.env-derived values are validated
+    # in build_command (numbers via int(), content order allow-listed, DEF CON list matched, paths/names refuse a leading '-').
     return subprocess.call(command, cwd=ROOT)
 
 

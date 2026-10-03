@@ -25,7 +25,7 @@ infocon-scraper = "infocon_scraper:main"
 infocon-torrents = "fetch_defcon_torrents:main"
 
 [tool.setuptools]
-py-modules = ["infocon_scraper", "fetch_defcon_torrents"]
+py-modules = ["infocon_scraper", "fetch_defcon_torrents", "ddv_profiles", "drive_setup"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
