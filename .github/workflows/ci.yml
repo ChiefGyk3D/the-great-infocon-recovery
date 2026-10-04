@@ -37,8 +37,7 @@ jobs:
         pip install ruff
       lint-command: |
         ruff check .
-      # No smoke-command: the old workflow had none, and `infocon-scraper --help` after `pip install .` fails with
-      # ModuleNotFoundError: ddv_profiles, because pyproject.toml's py-modules omits ddv_profiles and drive_setup.
+      smoke-command: infocon-scraper --help
       docker-build: false
       egress-policy: block
       doppler-project: ci
