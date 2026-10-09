@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/python-ci.yml@cc7fa6f48a612183ecd900ed15810da61b30288a # v1.17.0
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/python-ci.yml@faba0b7d1ab65e9033bef1acfa93d6d57b5808c0 # v1.21.0
     permissions:
       contents: read
       id-token: write   # Doppler OIDC (see the shared repository's README)
@@ -34,7 +34,7 @@ jobs:
         pip install --no-deps -e .
       test-command: python -m pytest tests/ -v
       lint-install-command: |
-        pip install ruff
+        pip install "ruff==0.16.9"
       lint-command: |
         ruff check .
       smoke-command: infocon-scraper --help
@@ -45,7 +45,7 @@ jobs:
       doppler-identity-id: ${{ vars.DOPPLER_IDENTITY_ID }}
 
   shell:
-    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/bash-ci.yml@cc7fa6f48a612183ecd900ed15810da61b30288a # v1.17.0
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/bash-ci.yml@faba0b7d1ab65e9033bef1acfa93d6d57b5808c0 # v1.21.0
     permissions:
       contents: read
     with:
