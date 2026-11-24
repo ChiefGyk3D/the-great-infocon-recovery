@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/python-ci.yml@0db5ee880d1b4e37eb27443ffc1c37bd4ce8e8a2 # v1.35.0
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/python-ci.yml@ff658b7c11a55eea1394af5fd1a3a1b4b09d9cd0 # v1.36.0
     permissions:
       contents: read
       id-token: write   # Doppler OIDC (see the shared repository's README)
@@ -45,7 +45,7 @@ jobs:
       doppler-identity-id: ${{ vars.DOPPLER_IDENTITY_ID }}
 
   shell:
-    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/bash-ci.yml@0db5ee880d1b4e37eb27443ffc1c37bd4ce8e8a2 # v1.35.0
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/bash-ci.yml@ff658b7c11a55eea1394af5fd1a3a1b4b09d9cd0 # v1.36.0
     permissions:
       contents: read
     with:
