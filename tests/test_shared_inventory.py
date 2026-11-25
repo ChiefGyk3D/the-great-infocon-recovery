@@ -288,6 +288,22 @@ class TestMergeInfoconCandidates(unittest.TestCase):
         self.assertIn("v1", result[0].url)
 
 
+class TestSourcePriorityHost(unittest.TestCase):
+
+    def _prio(self, url: str) -> int:
+        from fetch_defcon_torrents import TorrentSpec, torrent_source_priority
+        return torrent_source_priority(TorrentSpec(name="x", url=url, save_path="/dest/other"))
+
+    def test_exact_host_is_preferred(self):
+        self.assertEqual(self._prio("https://media.defcon.org/DEF CON 30.torrent"), 0)
+        self.assertEqual(self._prio("https://MEDIA.defcon.org:443/a.torrent"), 0)
+
+    def test_host_must_match_not_appear_elsewhere_in_the_url(self):
+        self.assertEqual(self._prio("https://example.org/media.defcon.org/a.torrent"), 2)
+        self.assertEqual(self._prio("https://media.defcon.org.example.org/a.torrent"), 2)
+        self.assertEqual(self._prio("https://example.org/a.torrent?u=media.defcon.org"), 2)
+
+
 class TestTorrentDiscoveryRetry(unittest.TestCase):
 
     def test_transient_listing_error_is_retried_without_marking_visited(self):

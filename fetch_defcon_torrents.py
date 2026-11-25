@@ -39,7 +39,7 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from collections.abc import Callable
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, urlsplit
 
 import libtorrent as lt
 from bs4 import BeautifulSoup
@@ -627,9 +627,17 @@ def torrent_logical_name(name: str) -> str:
     return torrent_content_folder(name).lower()
 
 
+def _is_media_defcon_host(url: str) -> bool:
+    """True only when the URL's host is exactly media.defcon.org."""
+    try:
+        return (urlsplit(url).hostname or "").lower() == "media.defcon.org"
+    except ValueError:
+        return False
+
+
 def torrent_source_priority(spec: TorrentSpec) -> int:
     """Prefer media.defcon.org for every DEF CON archive."""
-    if "media.defcon.org" in spec.url.lower():
+    if _is_media_defcon_host(spec.url):
         return 0
     path = spec.save_path.replace(os.sep, "/").lower().rstrip("/")
     if path.endswith("/cons/def con/def con torrents"):
